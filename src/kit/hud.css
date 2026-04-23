@@ -1,0 +1,80 @@
+/* HUD base styles. All HUDs overlay a positioned container (usually #stage).
+ * Per-instance color is driven by a --hud-accent CSS custom property set on
+ * the root element by Hud.js based on theme.hudAccents. Colors, fonts, and
+ * spacing tokens mirror src/kit/theme.js — do not add new hex values here. */
+
+.hud-panel,
+.hud-chart {
+  position: absolute;
+  font-family: "JetBrains Mono", monospace;
+  font-size: 11px;
+  color: var(--hud-accent, #e8ecf2);
+  background: rgba(7, 9, 13, 0.75);
+  border: 0.5px solid rgba(255, 255, 255, 0.15);
+  border-radius: 6px;
+  padding: 8px 12px;
+  pointer-events: none;
+  user-select: none;
+  backdrop-filter: blur(2px);
+  -webkit-backdrop-filter: blur(2px);
+  letter-spacing: 0.02em;
+  line-height: 1.5;
+}
+
+/* Corner placement. */
+.hud-corner-tl { top: 16px; left: 16px; }
+.hud-corner-tr { top: 16px; right: 16px; }
+.hud-corner-bl { bottom: 16px; left: 16px; }
+.hud-corner-br { bottom: 16px; right: 16px; }
+
+.hud-panel .hud-title {
+  font-family: "Noto Sans SC", sans-serif;
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--hud-accent, #e8ecf2);
+  margin-bottom: 6px;
+  padding-bottom: 4px;
+  border-bottom: 0.5px solid rgba(255, 255, 255, 0.08);
+  letter-spacing: 0.04em;
+}
+
+.hud-panel .hud-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 16px;
+  min-width: 160px;
+}
+
+.hud-panel .hud-label {
+  font-family: "Noto Sans SC", sans-serif;
+  color: rgba(232, 236, 242, 0.65);
+  font-size: 11px;
+}
+
+.hud-panel .hud-value {
+  color: var(--hud-accent, #e8ecf2);
+  font-variant-numeric: tabular-nums;
+}
+
+.hud-panel .hud-unit {
+  color: rgba(232, 236, 242, 0.45);
+  font-size: 10px;
+  margin-left: 3px;
+}
+
+/* Chart. */
+.hud-chart {
+  padding: 6px 8px 4px;
+}
+.hud-chart .hud-chart-title {
+  font-family: "Noto Sans SC", sans-serif;
+  font-size: 11px;
+  color: var(--hud-accent, #e8ecf2);
+  margin-bottom: 4px;
+  letter-spacing: 0.04em;
+  opacity: 0.85;
+}
+.hud-chart canvas {
+  display: block;
+}
