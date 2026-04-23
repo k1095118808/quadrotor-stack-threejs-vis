@@ -31,19 +31,19 @@ Produce a web-based presentation that introduces research newcomers to quadrotor
 ### Phase 0 — Kit and theme (Week 1)
 **Blocking.** No chapter work starts before this is done.
 
-- [ ] Scaffold project: `npm create vite@latest`, bare vanilla setup
-- [ ] Install deps: `three`
-- [ ] Fonts in `index.html` (Noto Sans SC, JetBrains Mono)
-- [ ] Implement `src/kit/theme.js` (colors, fonts, HUD tokens)
-- [ ] Implement `src/kit/labels.js` (empty skeleton — fill per chapter as we go)
-- [ ] Implement `src/kit/Environment.js`
-- [ ] Implement `src/kit/Quadrotor.js`
-- [ ] Implement `src/kit/Trajectory.js`
-- [ ] Implement `src/kit/Sensors.js`
-- [ ] Implement `src/kit/CameraRig.js`
-- [ ] Implement `src/kit/Hud.js` + `hud.css`
-- [ ] Reference scene `src/kit-demo.html` exercising every kit module (this is the acceptance test)
-- [ ] Root `index.html` gallery page listing every animation
+- [x] Scaffold project: `npm create vite@latest`, bare vanilla setup
+- [x] Install deps: `three`
+- [x] Fonts in `index.html` (Noto Sans SC, JetBrains Mono)
+- [x] Implement `src/kit/theme.js` (colors, fonts, HUD tokens)
+- [x] Implement `src/kit/labels.js` (empty skeleton — fill per chapter as we go)
+- [x] Implement `src/kit/Environment.js`
+- [x] Implement `src/kit/Quadrotor.js`
+- [x] Implement `src/kit/Trajectory.js`
+- [x] Implement `src/kit/Sensors.js`
+- [x] Implement `src/kit/CameraRig.js`
+- [x] Implement `src/kit/Hud.js` + `hud.css`
+- [x] Reference scene `src/kit-demo.html` exercising every kit module (this is the acceptance test)
+- [x] Root `index.html` gallery page listing every animation
 
 **Acceptance:** open `src/kit-demo.html` in the browser, see a drone on a grid flying a loop through obstacles with a LIDAR fan, a camera frustum, a trail, two HUD panels, and one altitude chart. Looks like the prototype from earlier in the conversation.
 
@@ -275,7 +275,7 @@ Only if schedule permits.
 
 | Animation | Phase | Status | Commit |
 |---|---|---|---|
-| Kit + theme + demo | 0 | ☐ | |
+| Kit + theme + demo | 0 | ☑ | feat/phase-0-kit |
 | Ch1-1 技术栈 | 1 | ☐ | |
 | Ch1-2 频率金字塔 | 1 | ☐ | |
 | Ch1-3 耦合图 | 1 | ☐ | |
@@ -358,3 +358,4 @@ export const labels = {
 ## 12. Changelog
 
 - 2026-04-23 · Initial plan.
+- 2026-04-23 · Phase 0 complete. Kit modules, demo scene, gallery landed on `feat/phase-0-kit`.

@@ -1,0 +1,224 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Kit Demo · 工具包演示</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+SC:wght@300;400;500;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/src/kit/hud.css">
+  <style>
+    html, body { margin: 0; background: #07090d; overflow: hidden; }
+  </style>
+</head>
+<body>
+  <div id="stage" style="position:relative;width:100vw;height:100vh"></div>
+
+  <script type="module">
+    import * as THREE from 'three';
+    import { createEnvironment } from '/src/kit/Environment.js';
+    import { createDrone }       from '/src/kit/Quadrotor.js';
+    import { createPath, createTrail } from '/src/kit/Trajectory.js';
+    import { createLidar, createFrustum } from '/src/kit/Sensors.js';
+    import { followCamera }      from '/src/kit/CameraRig.js';
+    import { createPanel, createChart } from '/src/kit/Hud.js';
+    import { labels }            from '/src/kit/labels.js';
+    import { theme }             from '/src/kit/theme.js';
+
+    // 1. scene ------------------------------------------------------------
+    const { scene, addLights, dispose: disposeEnv } = createEnvironment({
+      theme: 'dark', grid: true, fog: true, floor: true, sceneSize: 60,
+    });
+    addLights();
+
+    // 2. camera + renderer ------------------------------------------------
+    const stage = document.getElementById('stage');
+    const camera = new THREE.PerspectiveCamera(
+      55, stage.clientWidth / stage.clientHeight, 0.1, 200,
+    );
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setSize(stage.clientWidth, stage.clientHeight);
+    renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+    stage.appendChild(renderer.domElement);
+
+    // 3. scene content ----------------------------------------------------
+    // Obstacles: cylindrical pillars arranged around the flight loop so the
+    // LIDAR has interesting hits regardless of which way the drone faces.
+    const obstacles = new THREE.Group();
+    const obstacleMat = new THREE.MeshStandardMaterial({
+      color: theme.colors.obstacle, metalness: 0.2, roughness: 0.8,
+    });
+    const pillarGeo = new THREE.CylinderGeometry(0.45, 0.45, 3.2, 20);
+    const pillarPositions = [
+      [ 3.5, 1.6,  0.0],
+      [ 0.0, 1.6,  3.5],
+      [-3.5, 1.6,  0.0],
+      [ 0.0, 1.6, -3.5],
+      [ 2.4, 1.6,  2.4],
+      [-2.4, 1.6, -2.4],
+      [ 2.4, 1.6, -2.4],
+      [-2.4, 1.6,  2.4],
+    ];
+    for (const [x, y, z] of pillarPositions) {
+      const p = new THREE.Mesh(pillarGeo, obstacleMat);
+      p.position.set(x, y, z);
+      obstacles.add(p);
+    }
+    scene.add(obstacles);
+
+    // Path: Catmull-Rom loop above the pillar ring at altitude ~2.4 m.
+    const waypoints = [
+      new THREE.Vector3( 5.0, 2.4,  0.0),
+      new THREE.Vector3( 3.2, 2.8,  3.2),
+      new THREE.Vector3( 0.0, 2.2,  5.0),
+      new THREE.Vector3(-3.2, 2.8,  3.2),
+      new THREE.Vector3(-5.0, 2.4,  0.0),
+      new THREE.Vector3(-3.2, 1.9, -3.2),
+      new THREE.Vector3( 0.0, 2.6, -5.0),
+      new THREE.Vector3( 3.2, 1.9, -3.2),
+    ];
+    const { curve, line: pathLine, markers } = createPath(waypoints, {
+      closed: true, tension: 0.5,
+    });
+    scene.add(pathLine);
+    scene.add(markers);
+
+    // Drone.
+    const drone = createDrone({
+      scale: 1.3,
+      accentColor: theme.colors.executed,
+      showThrustVector: false,
+    });
+    scene.add(drone.group);
+
+    // Attach a camera frustum to the drone so it yaws with the body.
+    const frustum = createFrustum({ fov: 60, aspect: 1.5, near: 0.15, far: 2.2 });
+    drone.group.add(frustum);
+
+    // LIDAR fan, also attached to the drone at body altitude.
+    const lidar = createLidar({ numRays: 48, range: 4.5, fov: 360 });
+    drone.group.add(lidar.group);
+
+    // Magenta trail in the executed color.
+    const trail = createTrail({ maxPoints: 1200, color: theme.colors.executed });
+    scene.add(trail.line);
+
+    // 4. HUD overlays -----------------------------------------------------
+    const telemetry = createPanel({
+      title: labels.demo.telemetry,
+      corner: 'tl',
+      color: 'cyan',
+      items: [
+        { key: 'alt', label: labels.common.altitude, value: '0.00', unit: 'm' },
+        { key: 'vel', label: labels.common.velocity, value: '0.00', unit: 'm/s' },
+        { key: 'yaw', label: labels.common.attitude, value: '0°',   unit: '' },
+      ],
+    });
+    stage.appendChild(telemetry.el);
+
+    const sensors = createPanel({
+      title: labels.demo.sensors,
+      corner: 'tr',
+      color: 'green',
+      items: [
+        { key: 'hits',  label: labels.demo.lidarHits, value: '0',   unit: '' },
+        { key: 'range', label: labels.common.frequency, value: '48', unit: 'Hz' },
+        { key: 'trail', label: labels.demo.trail, value: '0',        unit: 'pts' },
+      ],
+    });
+    stage.appendChild(sensors.el);
+
+    const altChart = createChart({
+      corner: 'br',
+      title: labels.demo.altChart,
+      yRange: [0, 4],
+      color: 'magenta',
+      width: 240, height: 72,
+    });
+    stage.appendChild(altChart.el);
+
+    // 5. loop -------------------------------------------------------------
+    const clock = new THREE.Clock();
+    let pathT = 0;
+    const loopSeconds = 16;
+
+    const pos = new THREE.Vector3();
+    const nextPos = new THREE.Vector3();
+    const tangent = new THREE.Vector3();
+    const up = new THREE.Vector3(0, 1, 0);
+    const lookMat = new THREE.Matrix4();
+    let trailTick = 0;
+
+    (function tick() {
+      const dt = clock.getDelta();
+      pathT = (pathT + dt / loopSeconds) % 1;
+
+      // Drive drone along the path; yaw it to face the tangent.
+      curve.getPointAt(pathT, pos);
+      curve.getPointAt((pathT + 0.001) % 1, nextPos);
+      tangent.subVectors(nextPos, pos).normalize();
+      drone.group.position.copy(pos);
+      lookMat.lookAt(pos, pos.clone().add(tangent), up);
+      drone.group.quaternion.setFromRotationMatrix(lookMat);
+
+      drone.update(dt);
+
+      // Sensors: cast LIDAR against the pillar group; pillars are in world
+      // space, the drone's LIDAR group is a child of the drone so we pass the
+      // drone's world position + yaw for the ray fan.
+      const worldPos = new THREE.Vector3();
+      drone.group.getWorldPosition(worldPos);
+      const worldQuat = new THREE.Quaternion();
+      drone.group.getWorldQuaternion(worldQuat);
+      const hitCount = lidar.cast(worldPos, worldQuat, obstacles.children);
+
+      // Trail: sample every other frame so the line stays readable at speed.
+      trailTick++;
+      if (trailTick % 2 === 0) trail.push(worldPos);
+
+      // HUD updates.
+      const velocity = tangent.length() > 0 ? (curve.getLength() / loopSeconds) : 0;
+      telemetry.setValue('alt', worldPos.y.toFixed(2));
+      telemetry.setValue('vel', velocity.toFixed(2));
+      const yawDeg = Math.atan2(tangent.x, tangent.z) * 180 / Math.PI;
+      telemetry.setValue('yaw', `${yawDeg.toFixed(0)}°`);
+      sensors.setValue('hits', String(hitCount));
+      sensors.setValue('trail', String(Math.min(trailTick / 2 | 0, 1200)));
+      altChart.push(worldPos.y);
+
+      // Camera: follow from behind-and-above, lerped for a cinematic feel.
+      followCamera(camera, drone.group, {
+        offset: new THREE.Vector3(-3.5, 2.2, -6.0),
+        lerp: 0.05,
+      });
+
+      renderer.render(scene, camera);
+      requestAnimationFrame(tick);
+    })();
+
+    // 6. resize -----------------------------------------------------------
+    addEventListener('resize', () => {
+      camera.aspect = stage.clientWidth / stage.clientHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(stage.clientWidth, stage.clientHeight);
+    });
+
+    // 7. dispose on navigation away (the slide-deck gotcha from CLAUDE.md).
+    addEventListener('beforeunload', () => {
+      drone.dispose();
+      trail.dispose();
+      lidar.dispose();
+      pathLine.userData.dispose?.();
+      markers.userData.dispose?.();
+      pillarGeo.dispose();
+      obstacleMat.dispose();
+      telemetry.dispose();
+      sensors.dispose();
+      altChart.dispose();
+      disposeEnv();
+      renderer.dispose();
+    });
+  </script>
+</body>
+</html>
