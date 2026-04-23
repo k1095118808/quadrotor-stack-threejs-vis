@@ -1,0 +1,38 @@
+# ---------------------------
+# IDE / Editor
+# ---------------------------
+
+# VS Code
+.vscode/*
+
+# JetBrains (WebStorm, IntelliJ, etc.)
+.idea/
+*.iml
+
+# Visual Studio
+.vs/
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+
+# Vim / Neovim
+*.swp
+*.swo
+*~
+
+# ---------------------------
+# AI / Assistant tooling
+# ---------------------------
+.cursor/
+.cursor-cache/
+
+.claude/
+
+.aider*
+.aider/
+
+.prompts/
+.ai/
+.llm/
+.cache/ai/
