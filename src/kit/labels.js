@@ -1,0 +1,53 @@
+// All user-visible Chinese strings live here. Animations MUST NOT hard-code
+// Chinese inline — add the string here and import it. Seeded from
+// PROJECT_PLAN.md section 10; expand per chapter as animations land.
+
+export const labels = {
+  common: {
+    altitude:   '高度',
+    velocity:   '速度',
+    thrust:     '推力',
+    attitude:   '姿态',
+    position:   '位置',
+    error:      '误差',
+    mode:       '模式',
+    frequency:  '频率',
+    on:         '开启',
+    off:        '关闭',
+  },
+  layers: {
+    hardware:     '硬件层',
+    control:      '控制层',
+    localization: '定位层',
+    planning:     '规划层',
+    perception:   '感知层',
+    coordination: '协同层',
+  },
+  ch01: {
+    stackTitle:    '自主飞行技术栈',
+    pyramidTitle:  '频率金字塔',
+    couplingTitle: '模块耦合',
+  },
+  ch02: {
+    explodedTitle:     '四旋翼组件',
+    imuVibrationTitle: 'IMU 振动耦合',
+    frame:     '机架',
+    motor:     '电机',
+    esc:       '电调',
+    battery:   '电池',
+    fc:        '飞控',
+    imu:       'IMU',
+    camera:    '相机',
+    gnss:      'GNSS 天线',
+    companion: '机载计算机',
+  },
+  demo: {
+    // Strings used only by src/kit-demo.html (Phase 0 acceptance test).
+    title:     '工具包演示',
+    telemetry: '遥测',
+    sensors:   '传感器',
+    lidarHits: '激光命中',
+    trail:     '飞行轨迹',
+    altChart:  '高度曲线',
+  },
+};
