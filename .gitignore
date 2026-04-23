@@ -36,3 +36,13 @@
 .ai/
 .llm/
 .cache/ai/
+
+# ---------------------------
+# Node / Vite
+# ---------------------------
+node_modules/
+dist/
+.vite/
+*.log
+npm-debug.log*
+.DS_Store
