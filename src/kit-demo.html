@@ -96,9 +96,11 @@
     const frustum = createFrustum({ fov: 60, aspect: 1.5, near: 0.15, far: 2.2 });
     drone.group.add(frustum);
 
-    // LIDAR fan, also attached to the drone at body altitude.
+    // LIDAR fan. cast() writes world-space endpoints into the geometry, so
+    // the group belongs in the scene (not parented to the drone — that would
+    // double-transform every ray by the drone's world matrix).
     const lidar = createLidar({ numRays: 48, range: 4.5, fov: 360 });
-    drone.group.add(lidar.group);
+    scene.add(lidar.group);
 
     // Magenta trail in the executed color.
     const trail = createTrail({ maxPoints: 1200, color: theme.colors.executed });
