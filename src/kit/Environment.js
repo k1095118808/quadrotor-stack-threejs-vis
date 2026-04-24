@@ -206,7 +206,7 @@ function addLogoClouds(scene, sceneSize) {
   return { group, texture: tex, material };
 }
 
-// Builds a 1024² canvas of faint, rotated "EXAMPLE TEXTS" copies and returns
+// Builds a 1024² canvas of faint, rotated "NKU-ISAN-LAB" copies and returns
 // it as a CanvasTexture. Kept inside Environment.js since nothing else needs
 // it; if more chapters want a watermark layer we can promote it to the kit.
 function makeFloorWatermarkTexture() {
@@ -231,9 +231,9 @@ function makeFloorWatermarkTexture() {
   ctx.textBaseline = 'middle';
   ctx.textAlign = 'left';
 
-  const TEXT     = 'EXAMPLE TEXTS';
+  const TEXT     = 'NKU-ISAN-LAB';
   // Measure the text so adjacent copies don't abut — without the gap the
-  // repeat reads as one run-on "...TEXTSEXAMPLE..." string.
+  // repeat reads as one run-on "...LABNKU..." string.
   const textWidth = ctx.measureText(TEXT).width;
   const GAP      = 110;
   const ROW_STEP = 96;

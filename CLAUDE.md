@@ -87,7 +87,7 @@ export function createEnvironment({
 ```
 
 In `'light'` mode the floor is painted with a baked `CanvasTexture` of
-repeating "EXAMPLE TEXTS" copies in a deep purple/pink, the fog far plane is
+repeating "NKU-ISAN-LAB" copies in a deep purple/pink, the fog far plane is
 pushed out, the lighting rig flattens (no colored rim), and a `Group` of 7
 logo-sprite "clouds" drifts in a slow circle overhead at y ≈ 6–12 (textured
 from `/src/assets/logo1.png`). All of this is handled inside
@@ -256,7 +256,7 @@ A true-white "paper" variant ships alongside the dark scene. Activated by
 `?theme=light`, a localStorage preference, or the floating ☾/☀ toggle that
 every page mounts via `mountThemeToggle()`. Design notes:
 
-- **Floor** carries a deep purple/pink "EXAMPLE TEXTS" watermark baked as a
+- **Floor** carries a deep purple/pink "NKU-ISAN-LAB" watermark baked as a
   `CanvasTexture`. `index.html` mirrors it as an inline-SVG body background.
 - **Logo clouds.** Seven `THREE.Sprite` copies of `/src/assets/logo1.png`
   drift overhead at y ≈ 6–12 in a slow circle. Light-mode only.
