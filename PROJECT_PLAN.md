@@ -48,7 +48,7 @@ Produce a web-based presentation that introduces research newcomers to quadrotor
 **Acceptance:** open `src/kit-demo.html` in the browser, see a drone on a grid flying a loop through obstacles with a LIDAR fan, a camera frustum, a trail, two HUD panels, and one altitude chart. Looks like the prototype from earlier in the conversation.
 
 ### Phase 1 — Headline chapters (Week 2)
-- [ ] Ch1 P0×2 + P1×1
+- [x] Ch1 P0×2 + P1×1
 - [ ] Ch2 P0×2
 
 ### Phase 2 — Control and planning (Week 3)
@@ -276,9 +276,9 @@ Only if schedule permits.
 | Animation | Phase | Status | Commit |
 |---|---|---|---|
 | Kit + theme + demo | 0 | ☑ | feat/phase-0-kit |
-| Ch1-1 技术栈 | 1 | ☐ | |
-| Ch1-2 频率金字塔 | 1 | ☐ | |
-| Ch1-3 耦合图 | 1 | ☐ | |
+| Ch1-1 技术栈 | 1 | ☑ | abab3df |
+| Ch1-2 频率金字塔 | 1 | ☑ | 7d5debf |
+| Ch1-3 耦合图 | 1 | ☑ | 8d3ae82 |
 | Ch2-1 爆炸视图 | 1 | ☐ | |
 | Ch2-2 IMU 振动 | 1 | ☐ | |
 | Ch3-1 欠驱动 | 2 | ☐ | |
@@ -359,3 +359,4 @@ export const labels = {
 
 - 2026-04-23 · Initial plan.
 - 2026-04-23 · Phase 0 complete. Kit modules, demo scene, gallery landed on `feat/phase-0-kit`.
+- 2026-04-24 · Chapter 1 complete. Autonomy-stack, frequency-pyramid, and module-coupling animations merged to main (abab3df, 7d5debf, 8d3ae82). Next: Ch2 hardware pair (exploded view + IMU vibration).

@@ -240,6 +240,7 @@ Target size per animation file: **under 400 lines**. If it's creeping past that,
 - Always `dispose()` geometries, materials, and renderers when leaving a scene (matters when animations are embedded in a slide deck that switches scenes).
 - Camera `updateProjectionMatrix()` after any aspect change. Easy to forget.
 - `THREE.CapsuleGeometry` is fine in modern Three but **does not exist in r128** — irrelevant now that we're on latest, but worth knowing if you ever look at the earlier CDN-based prototype.
+- **Projected DOM labels must be pixel-quantized.** When you compute an overlay's screen position from `vec.project(camera)` and update it per frame, use `Math.round()` on both px coords and write the transform as `translate3d(x, y, 0)` — not `translate(x, y)`. Fractional 2D translates keep the glyphs in the main compositing pass and they re-rasterize at slightly different sub-positions every frame, which reads as jitter. Also set `will-change: transform` on the label class. Applies to plate/node/callout labels in Ch1-1, Ch1-3, and any future CSS2DRenderer-style Ch2 exploded-view callouts.
 
 ## Workflow
 
