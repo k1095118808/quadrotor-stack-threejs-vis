@@ -104,6 +104,21 @@ export const labels = {
       gnssEn:      'GNSS Antenna',
       companionEn: 'Companion Computer',
     },
+    vibration: {
+      // Sliders + readouts for the split-screen vibration demo.
+      controlsTitle: '控制',
+      rpm:           '转速',
+      cutoff:        '截止频率',
+      rotorFreq:     '转子频率',
+      snr:           '信噪比',
+      rawTitle:      '原始 IMU · a(t)',
+      filteredTitle: '一阶低通滤波后',
+      rawAxis:       '加速度 / m·s⁻²',
+      legendRaw:     '原始信号',
+      legendFilt:    '滤波后',
+      legendGravity: '重力基线',
+      note:          '信号模型：a(t) = g + A·sin(2πf·t) + n(t)',
+    },
   },
   demo: {
     // Strings used only by src/kit-demo.html (Phase 0 acceptance test).

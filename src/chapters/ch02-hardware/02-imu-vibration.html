@@ -1,0 +1,376 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Ch2 · IMU 振动耦合</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+SC:wght@300;400;500;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/src/kit/hud.css">
+  <style>
+    /* Signal model (matches the comment at the top of the script):
+     *   a(t) = g + A·sin(2π·f_rotor·t) + n(t)     // n ~ N(0, σ²)
+     *   y[n] = α·y[n-1] + (1-α)·x[n]              // 1st-order IIR LP
+     *   α    = exp(-2π·fc / Fs)                    // fc = cutoff (Hz)
+     * The raw and filtered lines are the same x[n] before and after y[·].   */
+
+    html, body { margin: 0; background: var(--stage-bg); color: var(--label-strong-fg); font-family: "Noto Sans SC", sans-serif; }
+    body { display: flex; width: 100vw; height: 100vh; overflow: hidden; }
+
+    #stage  { flex: 1 1 auto; position: relative; min-width: 0; }
+    #panel  {
+      flex: 0 0 420px;
+      display: flex; flex-direction: column;
+      gap: 12px;
+      padding: 20px 20px 22px;
+      background: var(--hud-bg);
+      border-left: 0.5px solid var(--hud-border);
+      backdrop-filter: blur(2px);
+    }
+    @media (max-width: 900px) { #panel { flex-basis: 340px; } }
+
+    .panel-title { font-size: 13px; font-weight: 500; letter-spacing: 0.04em; margin: 0 0 2px; }
+    .panel-sub   { font-family: "JetBrains Mono", monospace; font-size: 10px; color: var(--hud-unit); letter-spacing: 0.02em; }
+
+    .scope {
+      border: 0.5px solid var(--hud-border);
+      border-radius: 6px;
+      padding: 8px 10px 6px;
+      background: color-mix(in srgb, var(--stage-bg) 72%, transparent);
+    }
+    .scope-title { font-size: 11px; font-weight: 500; margin: 0 0 4px; display: flex; justify-content: space-between; align-items: baseline; }
+    .scope-title .units { font-family: "JetBrains Mono", monospace; font-size: 10px; color: var(--hud-unit); font-weight: 400; }
+    .scope canvas { display: block; width: 100%; height: 110px; }
+
+    #controls { display: flex; flex-direction: column; gap: 10px; padding-top: 4px; }
+    .row { display: flex; flex-direction: column; gap: 4px; }
+    .row-head { display: flex; justify-content: space-between; align-items: baseline; }
+    .row-head .lab { font-size: 11px; color: var(--hud-label); }
+    .row-head .val { font-family: "JetBrains Mono", monospace; font-size: 11px; color: var(--label-strong-fg); font-variant-numeric: tabular-nums; }
+    input[type=range] {
+      -webkit-appearance: none; appearance: none;
+      width: 100%; height: 3px; margin: 2px 0;
+      background: var(--hud-divider); border-radius: 2px; outline: none;
+      cursor: pointer;
+    }
+    input[type=range]::-webkit-slider-thumb {
+      -webkit-appearance: none; appearance: none;
+      width: 14px; height: 14px; border-radius: 50%;
+      background: var(--c-planning); border: 0.5px solid var(--hud-border);
+    }
+    input[type=range]::-moz-range-thumb {
+      width: 14px; height: 14px; border-radius: 50%;
+      background: var(--c-planning); border: 0.5px solid var(--hud-border);
+    }
+
+    #readouts { display: grid; grid-template-columns: 1fr 1fr; gap: 6px 18px; padding-top: 8px; border-top: 0.5px solid var(--hud-divider); }
+    #readouts .k { font-size: 11px; color: var(--hud-label); }
+    #readouts .v { font-family: "JetBrains Mono", monospace; font-size: 11px; color: var(--label-strong-fg); font-variant-numeric: tabular-nums; text-align: right; }
+
+    .note { font-family: "JetBrains Mono", monospace; font-size: 9.5px; color: var(--hud-unit); letter-spacing: 0.02em; line-height: 1.4; }
+  </style>
+</head>
+<body>
+  <div id="stage"></div>
+  <aside id="panel">
+    <div>
+      <div class="panel-title" id="title"></div>
+      <div class="panel-sub" id="subtitle">IMU Vibration Coupling</div>
+    </div>
+
+    <div class="scope">
+      <div class="scope-title"><span id="rawTitle"></span><span class="units" id="rawAxis"></span></div>
+      <canvas id="scopeRaw"></canvas>
+    </div>
+
+    <div class="scope">
+      <div class="scope-title"><span id="filtTitle"></span><span class="units" id="filtAxis"></span></div>
+      <canvas id="scopeFilt"></canvas>
+    </div>
+
+    <div id="controls">
+      <div class="row">
+        <div class="row-head"><span class="lab" id="rpmLab"></span><span class="val"><span id="rpmVal">50</span> %</span></div>
+        <input id="rpm" type="range" min="0" max="100" step="1" value="50">
+      </div>
+      <div class="row">
+        <div class="row-head"><span class="lab" id="cutoffLab"></span><span class="val"><span id="cutoffVal">30</span> Hz</span></div>
+        <input id="cutoff" type="range" min="5" max="200" step="1" value="30">
+      </div>
+    </div>
+
+    <div id="readouts">
+      <span class="k" id="rpmFreqLab"></span><span class="v" id="rpmFreqVal">—</span>
+      <span class="k" id="snrLab"></span>      <span class="v" id="snrVal">—</span>
+    </div>
+    <div class="note" id="modelNote"></div>
+  </aside>
+
+  <script type="module">
+    import * as THREE from 'three';
+    import { createEnvironment } from '/src/kit/Environment.js';
+    import { createDrone }       from '/src/kit/Quadrotor.js';
+    import { labels }            from '/src/kit/labels.js';
+    import { theme, mountThemeToggle, hexToCss } from '/src/kit/theme.js';
+
+    // Wire up the Chinese copy at runtime so everything lives in labels.js.
+    const L = labels.ch02.vibration;
+    document.getElementById('title').textContent    = labels.ch02.imuVibrationTitle;
+    document.getElementById('rawTitle').textContent = L.rawTitle;
+    document.getElementById('rawAxis').textContent  = L.rawAxis;
+    document.getElementById('filtTitle').textContent= L.filteredTitle;
+    document.getElementById('filtAxis').textContent = L.rawAxis;
+    document.getElementById('rpmLab').textContent   = L.rpm;
+    document.getElementById('cutoffLab').textContent= L.cutoff;
+    document.getElementById('rpmFreqLab').textContent = L.rotorFreq;
+    document.getElementById('snrLab').textContent     = L.snr;
+    document.getElementById('modelNote').textContent  = L.note;
+
+    // --- 3D stage --------------------------------------------------------
+    const stage = document.getElementById('stage');
+    const { scene, addLights, dispose: disposeEnv } = createEnvironment({
+      grid: true, fog: true, floor: true, sceneSize: 35,
+    });
+    addLights();
+    mountThemeToggle();
+
+    const camera = new THREE.PerspectiveCamera(48, 1, 0.05, 100);
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+    function fitStage() {
+      const w = stage.clientWidth, h = stage.clientHeight;
+      renderer.setSize(w, h, false);
+      camera.aspect = w / h;
+      camera.updateProjectionMatrix();
+    }
+    stage.appendChild(renderer.domElement);
+    fitStage();
+
+    const drone = createDrone({
+      scale: 1.6,
+      accentColor: theme.colors.executed,
+      showThrustVector: false,
+    });
+    drone.group.position.y = 1.2;
+    scene.add(drone.group);
+
+    // Soft motion trails for the rotor tips — turn them up at high RPM so the
+    // viewer *sees* rotor speed rather than just hearing the HUD claim it.
+    const hubBlurMat = new THREE.MeshBasicMaterial({
+      color: theme.colors.control, transparent: true, opacity: 0.0,
+      side: THREE.DoubleSide, depthWrite: false,
+      blending: theme.mode === 'light' ? THREE.NormalBlending : THREE.AdditiveBlending,
+    });
+    const hubBlurGeo = new THREE.RingGeometry(0.14, 0.24, 32);
+    const hubBlurs = [];
+    for (const sx of [-1, 1]) for (const sz of [-1, 1]) {
+      const m = new THREE.Mesh(hubBlurGeo, hubBlurMat);
+      m.rotation.x = -Math.PI / 2;
+      m.position.set(sx * 0.55 * Math.SQRT1_2, 0.08, sz * 0.55 * Math.SQRT1_2);
+      m.scale.setScalar(1.6);
+      drone.group.add(m);
+      hubBlurs.push(m);
+    }
+
+    // --- Signal pipeline -------------------------------------------------
+    // Internal sample rate decouples the simulation from the frame rate so
+    // the raw trace reflects the true oscillation, not the 60 Hz render cadence.
+    const G_ACCEL = 9.81;
+    const FS_INTERNAL = 600;         // Hz — sim + display ring buffer
+    const WINDOW_S = 1.0;            // s  — horizontal extent per scope
+    const N_SAMPLES = Math.round(FS_INTERNAL * WINDOW_S);
+
+    const rawBuf  = new Float32Array(N_SAMPLES);
+    const filtBuf = new Float32Array(N_SAMPLES);
+    rawBuf.fill(G_ACCEL); filtBuf.fill(G_ACCEL);
+    let writeIdx = 0;
+    let simPhase = 0;   // radians — integrated 2π·f_rotor·t, wrapped
+    let filtState = G_ACCEL;
+
+    // UI state — read on every frame by the sim loop.
+    const rpmEl    = document.getElementById('rpm');
+    const cutoffEl = document.getElementById('cutoff');
+    const rpmValEl = document.getElementById('rpmVal');
+    const cutValEl = document.getElementById('cutoffVal');
+    const freqValEl= document.getElementById('rpmFreqVal');
+    const snrValEl = document.getElementById('snrVal');
+
+    function readParams() {
+      const rpmPct = +rpmEl.value;
+      const cutoff = +cutoffEl.value;
+      // Representative numbers: a 5-inch quadrotor at 100 % throttle spins
+      // ~25k rpm → ~415 Hz. We cap below Nyquist of the display buffer so
+      // the raw trace stays readable; the teaching point is the SNR delta.
+      const fRotor = 15 + rpmPct * 1.35;
+      const A      = 0.15 + rpmPct * 0.082;
+      const noise  = 0.12;
+      return { rpmPct, cutoff, fRotor, A, noise };
+    }
+
+    let params = readParams();
+    rpmEl.addEventListener('input', () => {
+      params = readParams();
+      rpmValEl.textContent = params.rpmPct;
+      freqValEl.textContent = params.fRotor.toFixed(0) + ' Hz';
+      drone.setThrust(params.rpmPct / 100);
+    });
+    cutoffEl.addEventListener('input', () => {
+      params = readParams();
+      cutValEl.textContent = params.cutoff;
+    });
+    // Seed displayed values.
+    drone.setThrust(params.rpmPct / 100);
+    rpmValEl.textContent = params.rpmPct;
+    cutValEl.textContent = params.cutoff;
+    freqValEl.textContent = params.fRotor.toFixed(0) + ' Hz';
+
+    // Gaussian noise via Box-Muller. Cached to halve sqrt/log cost.
+    let nCache = null;
+    function randn() {
+      if (nCache !== null) { const v = nCache; nCache = null; return v; }
+      let u = 0, v = 0;
+      while (u === 0) u = Math.random();
+      while (v === 0) v = Math.random();
+      const m = Math.sqrt(-2 * Math.log(u));
+      nCache = m * Math.sin(2 * Math.PI * v);
+      return m * Math.cos(2 * Math.PI * v);
+    }
+
+    function advanceSim(dt) {
+      const n = Math.min(N_SAMPLES, Math.max(1, Math.round(dt * FS_INTERNAL)));
+      const dtStep = 1 / FS_INTERNAL;
+      const { fRotor, A, noise, cutoff } = params;
+      const alpha = Math.exp(-2 * Math.PI * cutoff / FS_INTERNAL);
+      const twoPiF = 2 * Math.PI * fRotor;
+      for (let i = 0; i < n; i++) {
+        simPhase += twoPiF * dtStep;
+        if (simPhase > 2 * Math.PI) simPhase -= 2 * Math.PI;
+        const raw = G_ACCEL + A * Math.sin(simPhase) + noise * randn();
+        filtState = alpha * filtState + (1 - alpha) * raw;
+        rawBuf[writeIdx]  = raw;
+        filtBuf[writeIdx] = filtState;
+        writeIdx = (writeIdx + 1) % N_SAMPLES;
+      }
+    }
+
+    // --- Oscilloscope renderer ------------------------------------------
+    // yRange is centered on g so both traces share a baseline. The visible
+    // amplitude axis is fixed at ±9 m/s² so the viewer sees the raw spike
+    // dwarf the filtered trace at high RPM instead of autoscaling it away.
+    function setupCanvas(canvas) {
+      const dpr = Math.min(window.devicePixelRatio || 1, 2);
+      const rect = canvas.getBoundingClientRect();
+      canvas.width  = Math.max(1, Math.round(rect.width  * dpr));
+      canvas.height = Math.max(1, Math.round(rect.height * dpr));
+      const ctx = canvas.getContext('2d');
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      return { ctx, w: rect.width, h: rect.height };
+    }
+
+    const Y_LO = G_ACCEL - 9, Y_HI = G_ACCEL + 9;
+    function drawTrace(ctx, w, h, buf, color) {
+      ctx.clearRect(0, 0, w, h);
+
+      // Baseline at y = g.
+      const ySpan = Y_HI - Y_LO;
+      const yG = h - ((G_ACCEL - Y_LO) / ySpan) * h;
+      ctx.strokeStyle = getComputedStyle(ctx.canvas).getPropertyValue('--hud-divider').trim() || 'rgba(255,255,255,0.08)';
+      ctx.lineWidth = 0.5;
+      ctx.setLineDash([2, 3]);
+      ctx.beginPath(); ctx.moveTo(0, yG); ctx.lineTo(w, yG); ctx.stroke();
+      ctx.setLineDash([]);
+
+      // Trace — ring buffer unrolled so the oldest sample plots leftmost.
+      ctx.strokeStyle = color;
+      ctx.lineWidth = 1.1;
+      ctx.beginPath();
+      for (let i = 0; i < N_SAMPLES; i++) {
+        const idx = (writeIdx + i) % N_SAMPLES;
+        const v = buf[idx];
+        const x = (i / (N_SAMPLES - 1)) * w;
+        const y = h - ((v - Y_LO) / ySpan) * h;
+        if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+      }
+      ctx.stroke();
+    }
+
+    const rawCanvas  = document.getElementById('scopeRaw');
+    const filtCanvas = document.getElementById('scopeFilt');
+    let rawCtx, filtCtx, rawDim, filtDim;
+    function resizeScopes() {
+      rawDim  = setupCanvas(rawCanvas);  rawCtx  = rawDim.ctx;
+      filtDim = setupCanvas(filtCanvas); filtCtx = filtDim.ctx;
+    }
+    resizeScopes();
+
+    // SNR: 20·log10(g / rms(raw - g)). The window covers ~0.5s so the
+    // readout stabilises in a second or two after each slider move.
+    function computeSnrDb() {
+      const WIN = N_SAMPLES >> 1;
+      let sq = 0;
+      for (let i = 0; i < WIN; i++) {
+        const idx = (writeIdx - 1 - i + N_SAMPLES * 2) % N_SAMPLES;
+        const d = rawBuf[idx] - G_ACCEL;
+        sq += d * d;
+      }
+      const rms = Math.sqrt(sq / WIN) + 1e-6;
+      return 20 * Math.log10(G_ACCEL / rms);
+    }
+
+    // --- Main loop -------------------------------------------------------
+    const rawColor  = hexToCss(theme.colors.executed);
+    const filtColor = hexToCss(theme.colors.perception);
+    const clock = new THREE.Clock();
+    let snrSmoothed = 60;
+
+    (function tick() {
+      const dt = Math.min(0.05, clock.getDelta());
+
+      advanceSim(dt);
+
+      drawTrace(rawCtx,  rawDim.w,  rawDim.h,  rawBuf,  rawColor);
+      drawTrace(filtCtx, filtDim.w, filtDim.h, filtBuf, filtColor);
+
+      // Rotor blur: opacity ∝ RPM. The hub rings fake a motion-blur disk so
+      // the blades don't look frozen at high slider settings.
+      const blurAmt = params.rpmPct / 100;
+      hubBlurMat.opacity = blurAmt * 0.55;
+
+      // Synthesize a smooth wobble whose amplitude tracks RPM. Earlier we
+      // coupled the raw 600 Hz signal straight into pose, but at high RPM the
+      // 60 Hz render cadence aliased that into a jittery shimmer rather than
+      // a readable wobble. A pair of low-frequency sines keeps the motion
+      // obviously physical without fighting the render rate.
+      const t = performance.now() * 0.001;
+      const wobAmp = params.rpmPct / 100; // 0..1
+      const wob = 0.7 * Math.sin(t * 2 * Math.PI * 3.3) + 0.3 * Math.sin(t * 2 * Math.PI * 6.1);
+      drone.group.position.y = 1.2 + wobAmp * 0.12 * wob;
+      drone.group.rotation.z = wobAmp * 0.06 * wob;
+      drone.group.rotation.x = wobAmp * 0.05 * Math.sin(t * 2 * Math.PI * 4.7);
+      drone.update(dt);
+      const radius = 4.2;
+      camera.position.set(Math.cos(t * 0.18) * radius, 1.8, Math.sin(t * 0.18) * radius);
+      camera.lookAt(0, 1.0, 0);
+
+      const snr = computeSnrDb();
+      snrSmoothed += (snr - snrSmoothed) * 0.12;
+      snrValEl.textContent = snrSmoothed.toFixed(1) + ' dB';
+
+      renderer.render(scene, camera);
+      requestAnimationFrame(tick);
+    })();
+
+    // --- Resize + dispose -------------------------------------------------
+    addEventListener('resize', () => { fitStage(); resizeScopes(); });
+
+    addEventListener('beforeunload', () => {
+      drone.dispose();
+      hubBlurGeo.dispose();
+      hubBlurMat.dispose();
+      disposeEnv();
+      renderer.dispose();
+    });
+  </script>
+</body>
+</html>
