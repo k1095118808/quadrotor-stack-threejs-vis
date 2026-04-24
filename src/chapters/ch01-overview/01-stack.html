@@ -1,0 +1,398 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Ch1 · 自主飞行技术栈</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+SC:wght@300;400;500;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/src/kit/hud.css">
+  <style>
+    html, body { margin: 0; background: #07090d; overflow: hidden; }
+
+    /* Per-plate Chinese labels overlay: DOM elements projected from 3D plate
+     * centers each frame. Chinese copy lives in src/kit/labels.js. */
+    .stack-label {
+      position: absolute;
+      top: 0; left: 0;
+      font-family: "Noto Sans SC", sans-serif;
+      font-size: 12px;
+      font-weight: 400;
+      color: rgba(232, 236, 242, 0.62);
+      white-space: nowrap;
+      pointer-events: none;
+      padding: 2px 8px;
+      border-radius: 3px;
+      background: rgba(7, 9, 13, 0.55);
+      border: 0.5px solid rgba(255, 255, 255, 0.08);
+      letter-spacing: 0.04em;
+      transition: color 180ms, border-color 180ms;
+      will-change: transform;
+    }
+    .stack-label.active {
+      color: #5dffb1;
+      border-color: rgba(93, 255, 177, 0.45);
+    }
+
+    /* Flow-direction legend swatches inside the top-right HUD panel. */
+    .flow-swatch {
+      display: inline-block;
+      width: 9px; height: 9px;
+      border-radius: 50%;
+      margin-right: 6px;
+      transform: translateY(1px);
+      box-shadow: 0 0 6px currentColor;
+    }
+    .flow-swatch.up   { color: #5dffb1; background: #5dffb1; }
+    .flow-swatch.down { color: #ffb454; background: #ffb454; }
+  </style>
+</head>
+<body>
+  <div id="stage" style="position:relative;width:100vw;height:100vh"></div>
+
+  <script type="module">
+    import * as THREE from 'three';
+    import { createEnvironment } from '/src/kit/Environment.js';
+    import { createDrone }       from '/src/kit/Quadrotor.js';
+    import { createPanel }       from '/src/kit/Hud.js';
+    import { orbitCamera }       from '/src/kit/CameraRig.js';
+    import { labels }            from '/src/kit/labels.js';
+    import { theme }             from '/src/kit/theme.js';
+
+    // --- Layer model ------------------------------------------------------
+    // Bottom-up ordering matches the autonomy stack: hardware produces raw
+    // signals, coordination sits on top producing mission-level decisions.
+    const LAYERS = [
+      { key: 'hardware',     name: labels.layers.hardware,     freq: labels.ch01.stack.freqHardware },
+      { key: 'control',      name: labels.layers.control,      freq: labels.ch01.stack.freqControl },
+      { key: 'localization', name: labels.layers.localization, freq: labels.ch01.stack.freqLocalization },
+      { key: 'planning',     name: labels.layers.planning,     freq: labels.ch01.stack.freqPlanning },
+      { key: 'perception',   name: labels.layers.perception,   freq: labels.ch01.stack.freqPerception },
+      { key: 'coordination', name: labels.layers.coordination, freq: labels.ch01.stack.freqCoordination },
+    ];
+    const N_LAYERS     = LAYERS.length;
+    const PLATE_SIZE   = 4.0;
+    const PLATE_GAP    = 1.5;
+    const PLATE_BASE_Y = 0.8;
+    const PLATE_TOP_Y  = PLATE_BASE_Y + (N_LAYERS - 1) * PLATE_GAP;
+    const plateY = (i) => PLATE_BASE_Y + i * PLATE_GAP;
+
+    // --- Scene + renderer -------------------------------------------------
+    const { scene, addLights, dispose: disposeEnv } = createEnvironment({
+      theme: 'dark', grid: true, fog: true, floor: true, sceneSize: 50,
+    });
+    addLights();
+
+    const stage = document.getElementById('stage');
+    const camera = new THREE.PerspectiveCamera(
+      52, stage.clientWidth / stage.clientHeight, 0.1, 200,
+    );
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setSize(stage.clientWidth, stage.clientHeight);
+    renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+    stage.appendChild(renderer.domElement);
+
+    // --- Stack geometry: plates + wireframe edges + corner connectors ----
+    const stack = new THREE.Group();
+    const plateMeshes = [];
+    const plateEdges  = [];
+    const pulseTimers = new Float32Array(N_LAYERS);
+
+    const plateGeo = new THREE.BoxGeometry(PLATE_SIZE, 0.08, PLATE_SIZE);
+    const plateEdgeGeo = new THREE.EdgesGeometry(plateGeo);
+    for (let i = 0; i < N_LAYERS; i++) {
+      const mat = new THREE.MeshBasicMaterial({
+        color: theme.colors.grid,
+        transparent: true,
+        opacity: 0.12,
+        depthWrite: false,
+      });
+      const plate = new THREE.Mesh(plateGeo, mat);
+      plate.position.y = plateY(i);
+      stack.add(plate);
+      plateMeshes.push(plate);
+
+      const edgeMat = new THREE.LineBasicMaterial({
+        color: theme.colors.planning, transparent: true, opacity: 0.25,
+      });
+      const edges = new THREE.LineSegments(plateEdgeGeo, edgeMat);
+      edges.position.y = plateY(i);
+      stack.add(edges);
+      plateEdges.push(edges);
+    }
+
+    // Four corner connectors — thin vertical rails the particles travel on.
+    const CONNECTOR_R = PLATE_SIZE / 2 - 0.4;
+    const connectorCols = [
+      [ CONNECTOR_R,  CONNECTOR_R],
+      [-CONNECTOR_R,  CONNECTOR_R],
+      [-CONNECTOR_R, -CONNECTOR_R],
+      [ CONNECTOR_R, -CONNECTOR_R],
+    ];
+    const connectorMat = new THREE.LineBasicMaterial({
+      color: theme.colors.planning, transparent: true, opacity: 0.18,
+    });
+    for (const [cx, cz] of connectorCols) {
+      const geo = new THREE.BufferGeometry().setFromPoints([
+        new THREE.Vector3(cx, PLATE_BASE_Y - 0.05, cz),
+        new THREE.Vector3(cx, PLATE_TOP_Y + 0.05, cz),
+      ]);
+      stack.add(new THREE.Line(geo, connectorMat));
+    }
+
+    scene.add(stack);
+
+    // --- Drone hovering above the top plate ------------------------------
+    const drone = createDrone({
+      scale: 0.7,
+      accentColor: theme.colors.executed,
+      showThrustVector: false,
+    });
+    drone.group.position.y = PLATE_TOP_Y + 1.25;
+    scene.add(drone.group);
+
+    // --- Particle streams (uplink sensor data + downlink commands) -------
+    // Both streams share the same four-column routing; particles move along
+    // vertical progress ∈ [0,1]. AdditiveBlending gives the requested glow
+    // without a post-process pass.
+    function makeSprite() {
+      const c = document.createElement('canvas');
+      c.width = c.height = 64;
+      const ctx = c.getContext('2d');
+      const g = ctx.createRadialGradient(32, 32, 0, 32, 32, 30);
+      g.addColorStop(0.00, 'rgba(255,255,255,1)');
+      g.addColorStop(0.35, 'rgba(255,255,255,0.55)');
+      g.addColorStop(1.00, 'rgba(255,255,255,0)');
+      ctx.fillStyle = g;
+      ctx.fillRect(0, 0, 64, 64);
+      const tex = new THREE.CanvasTexture(c);
+      tex.colorSpace = THREE.SRGBColorSpace;
+      return tex;
+    }
+    const particleSprite = makeSprite();
+
+    function makeStream({ color, count, speed }) {
+      const positions = new Float32Array(count * 3);
+      const progress  = new Float32Array(count);
+      const columns   = new Uint8Array(count);
+      for (let i = 0; i < count; i++) {
+        progress[i] = Math.random();
+        columns[i]  = Math.floor(Math.random() * 4);
+      }
+      const geo = new THREE.BufferGeometry();
+      geo.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+      const mat = new THREE.PointsMaterial({
+        color,
+        size: 0.28,
+        map: particleSprite,
+        transparent: true,
+        depthWrite: false,
+        blending: THREE.AdditiveBlending,
+        sizeAttenuation: true,
+      });
+      const pts = new THREE.Points(geo, mat);
+      return { geo, mat, pts, positions, progress, columns, count, speed };
+    }
+
+    const uplink   = makeStream({ color: theme.colors.perception, count: 48, speed: 0.12 });
+    const downlink = makeStream({ color: theme.colors.control,    count: 40, speed: 0.09 });
+    scene.add(uplink.pts);
+    scene.add(downlink.pts);
+
+    // --- HUD panels -------------------------------------------------------
+    // Left: static legend — layer name + frequency band. Right: live flow
+    // indicator (active layer + cumulative particle counts).
+    const layersPanel = createPanel({
+      title: labels.ch01.stack.layersPanel,
+      corner: 'tl',
+      color: 'cyan',
+      items: LAYERS.slice().reverse().map(L => ({
+        key: L.key, label: L.name, value: L.freq,
+      })),
+    });
+    stage.appendChild(layersPanel.el);
+
+    const flowPanel = createPanel({
+      title: labels.ch01.stack.flowPanel,
+      corner: 'tr',
+      color: 'cyan',
+      items: [
+        { key: 'active', label: labels.ch01.stack.activeLayer, value: '—' },
+        { key: 'up',     label: labels.ch01.stack.uplink,      value: '0' },
+        { key: 'down',   label: labels.ch01.stack.downlink,    value: '0' },
+      ],
+    });
+    stage.appendChild(flowPanel.el);
+    // Inject color swatches next to the uplink/downlink rows so the
+    // green/amber color coding reads without needing legend text.
+    const flowRows = flowPanel.el.querySelectorAll('.hud-row');
+    if (flowRows[1]) {
+      const s = document.createElement('span');
+      s.className = 'flow-swatch up';
+      flowRows[1].querySelector('.hud-label').prepend(s);
+    }
+    if (flowRows[2]) {
+      const s = document.createElement('span');
+      s.className = 'flow-swatch down';
+      flowRows[2].querySelector('.hud-label').prepend(s);
+    }
+
+    // Per-plate 3D-anchored labels (projected each frame).
+    const plateLabels = LAYERS.map((L) => {
+      const el = document.createElement('div');
+      el.className = 'stack-label';
+      el.textContent = L.name;
+      stage.appendChild(el);
+      return el;
+    });
+
+    // --- Active-layer cycle + focusLayer() hook --------------------------
+    // The presenter can pin focus to a specific layer by calling
+    //   window.focusLayer(3)     // 0..5, bottom-up
+    //   window.focusLayer(null)  // resume auto cycle
+    // from the browser devtools during a talk.
+    let autoLayerIdx = 0;
+    let autoTimer    = 0;
+    let focusedLayer = -1;
+    const AUTO_DWELL = 3.0; // seconds per layer in auto mode
+
+    window.focusLayer = function (i) {
+      if (i == null || i < 0 || i >= N_LAYERS) { focusedLayer = -1; return; }
+      focusedLayer = i | 0;
+    };
+
+    // --- Main loop --------------------------------------------------------
+    const clock = new THREE.Clock();
+    let upCount = 0, downCount = 0;
+    const orbitTarget = new THREE.Vector3(0, (PLATE_BASE_Y + PLATE_TOP_Y) / 2, 0);
+    const projVec = new THREE.Vector3();
+
+    function advanceStream(stream, dt, direction) {
+      // direction: +1 = upward (uplink), -1 = downward (downlink)
+      const { positions, progress, columns, count, speed } = stream;
+      let wraps = 0;
+      const span = PLATE_TOP_Y - PLATE_BASE_Y;
+      for (let i = 0; i < count; i++) {
+        const prev = progress[i];
+        let next = prev + speed * dt;
+        if (next >= 1) { next -= 1; wraps++; }
+        progress[i] = next;
+
+        const t = direction > 0 ? next : 1 - next;
+        const y = PLATE_BASE_Y + t * span;
+        const [cx, cz] = connectorCols[columns[i]];
+        positions[i * 3 + 0] = cx;
+        positions[i * 3 + 1] = y;
+        positions[i * 3 + 2] = cz;
+
+        // Plate-pulse detection: did this particle cross a plate this frame?
+        const prevY = PLATE_BASE_Y + (direction > 0 ? prev : 1 - prev) * span;
+        const loY = Math.min(prevY, y);
+        const hiY = Math.max(prevY, y);
+        for (let k = 0; k < N_LAYERS; k++) {
+          const py = plateY(k);
+          if (py >= loY && py <= hiY) {
+            pulseTimers[k] = Math.min(1, pulseTimers[k] + 0.45);
+          }
+        }
+      }
+      stream.geo.attributes.position.needsUpdate = true;
+      return wraps;
+    }
+
+    (function tick() {
+      const dt = Math.min(0.05, clock.getDelta());
+
+      // Particles.
+      upCount   += advanceStream(uplink,   dt, +1);
+      downCount += advanceStream(downlink, dt, -1);
+
+      // Pulse decay → per-plate opacity. Base values stay dim so the stack
+      // reads as structure; pulse lifts it when data passes through.
+      for (let k = 0; k < N_LAYERS; k++) {
+        pulseTimers[k] = Math.max(0, pulseTimers[k] - dt * 1.6);
+        plateMeshes[k].material.opacity = 0.10 + pulseTimers[k] * 0.28;
+      }
+
+      // Active-layer cycle.
+      autoTimer += dt;
+      if (focusedLayer < 0 && autoTimer >= AUTO_DWELL) {
+        autoTimer = 0;
+        autoLayerIdx = (autoLayerIdx + 1) % N_LAYERS;
+      }
+      const active = focusedLayer >= 0 ? focusedLayer : autoLayerIdx;
+
+      // Edge color + opacity reflects active state; pulse adds a brief boost.
+      for (let k = 0; k < N_LAYERS; k++) {
+        const isActive = k === active;
+        plateEdges[k].material.color.setHex(
+          isActive ? theme.colors.perception : theme.colors.planning,
+        );
+        plateEdges[k].material.opacity =
+          (isActive ? 0.75 : 0.22) + pulseTimers[k] * 0.35;
+      }
+
+      // Drone bob above the top plate.
+      const tNow = performance.now() * 0.001;
+      drone.group.position.y = PLATE_TOP_Y + 1.25 + Math.sin(tNow * 1.1) * 0.08;
+      drone.group.rotation.y = tNow * 0.25;
+      drone.update(dt);
+
+      // HUD.
+      flowPanel.setValue('active', LAYERS[active].name);
+      flowPanel.setValue('up',   String(upCount));
+      flowPanel.setValue('down', String(downCount));
+
+      // Camera orbit — 24s per revolution, per spec.
+      orbitCamera(camera, {
+        target: orbitTarget,
+        radius: 13,
+        height: 8.5,
+        speed: (2 * Math.PI) / 24,
+      });
+
+      // Project plate labels to screen (with an upward pixel offset so the
+      // label hovers above the plate's rim instead of bisecting it).
+      const w = stage.clientWidth, h = stage.clientHeight;
+      for (let i = 0; i < N_LAYERS; i++) {
+        projVec.set(0, plateY(i) + 0.08, 0).project(camera);
+        const x =  (projVec.x * 0.5 + 0.5) * w;
+        const y = (-projVec.y * 0.5 + 0.5) * h - 18;
+        const visible = projVec.z > -1 && projVec.z < 1;
+        const el = plateLabels[i];
+        el.style.transform = `translate(${x}px, ${y}px) translate(-50%, -50%)`;
+        el.style.opacity = visible ? '1' : '0';
+        el.classList.toggle('active', i === active);
+      }
+
+      renderer.render(scene, camera);
+      requestAnimationFrame(tick);
+    })();
+
+    // --- Resize + dispose -------------------------------------------------
+    addEventListener('resize', () => {
+      camera.aspect = stage.clientWidth / stage.clientHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(stage.clientWidth, stage.clientHeight);
+    });
+
+    addEventListener('beforeunload', () => {
+      drone.dispose();
+      plateGeo.dispose();
+      plateEdgeGeo.dispose();
+      for (const m of plateMeshes) m.material.dispose();
+      for (const e of plateEdges)  e.material.dispose();
+      connectorMat.dispose();
+      uplink.geo.dispose();   uplink.mat.dispose();
+      downlink.geo.dispose(); downlink.mat.dispose();
+      particleSprite.dispose();
+      layersPanel.dispose();
+      flowPanel.dispose();
+      for (const l of plateLabels) l.remove();
+      disposeEnv();
+      renderer.dispose();
+    });
+  </script>
+</body>
+</html>

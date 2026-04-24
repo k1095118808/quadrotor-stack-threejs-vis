@@ -27,6 +27,21 @@ export const labels = {
     stackTitle:    '自主飞行技术栈',
     pyramidTitle:  '频率金字塔',
     couplingTitle: '模块耦合',
+    stack: {
+      layersPanel:  '层级 · 频率',
+      flowPanel:    '数据流',
+      activeLayer:  '当前层',
+      uplink:       '上行 · 传感数据',
+      downlink:     '下行 · 控制指令',
+      // Representative operating-frequency bands, intentionally rounded.
+      // Real ratios span ~3 orders of magnitude; see P0-2 for log discussion.
+      freqHardware:     '1 – 10 kHz',
+      freqControl:      '500 – 1000 Hz',
+      freqLocalization: '100 – 400 Hz',
+      freqPlanning:     '10 – 100 Hz',
+      freqPerception:   '10 – 60 Hz',
+      freqCoordination: '1 – 10 Hz',
+    },
   },
   ch02: {
     explodedTitle:     '四旋翼组件',
