@@ -1,0 +1,325 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Ch3 · SE(3) 几何控制</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+SC:wght@300;400;500;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/src/kit/hud.css">
+  <style>
+    /* Attitude lives on SO(3), not in Euler tuples. Current R (solid RGB
+     * triad) tracks a desired R_d (faded triad) under a proportional law
+     * on the Lie algebra so(3):
+     *
+     *   q_err = q_d · q⁻¹
+     *   ω      = 2·K_R · vec(q_err) · sign(q_err.w)
+     *
+     * which is the small-angle linearization of the matrix form
+     *   e_R = ½ (R_dᵀ R − Rᵀ R_d)∨
+     * Every 6 s a fresh R_d is sampled uniformly on SO(3); the magenta
+     * arrow visualises the current axis-angle error. */
+
+    html, body { margin: 0; background: var(--stage-bg); color: var(--label-strong-fg);
+                 font-family: "Noto Sans SC", sans-serif; overflow: hidden; }
+
+    #formula {
+      position: absolute; top: 24px; left: 50%; transform: translateX(-50%);
+      font-family: "JetBrains Mono", monospace;
+      font-size: 11px;
+      color: var(--label-fg);
+      background: var(--label-bg);
+      border: 0.5px solid var(--label-border);
+      border-radius: 3px;
+      padding: 5px 12px;
+      letter-spacing: 0.04em;
+      pointer-events: none;
+    }
+    #hint {
+      position: absolute; bottom: 20px; right: 20px;
+      font-family: "JetBrains Mono", monospace;
+      font-size: 10px;
+      color: var(--hud-unit);
+      pointer-events: none;
+    }
+
+  </style>
+</head>
+<body>
+  <div id="stage" style="position:relative;width:100vw;height:100vh"></div>
+  <div id="formula"></div>
+  <div id="hint"></div>
+
+  <script type="module">
+    import * as THREE from 'three';
+    import { createEnvironment } from '/src/kit/Environment.js';
+    import { createDrone }       from '/src/kit/Quadrotor.js';
+    import { createPanel }       from '/src/kit/Hud.js';
+    import { labels }            from '/src/kit/labels.js';
+    import { theme, mountThemeToggle, hexToCss } from '/src/kit/theme.js';
+
+    const L = labels.ch03.se3;
+    document.getElementById('formula').textContent = L.formula;
+    document.getElementById('hint').textContent    = L.hint;
+
+    // --- Scene -----------------------------------------------------------
+    const stage = document.getElementById('stage');
+    const { scene, addLights, dispose: disposeEnv } = createEnvironment({
+      grid: true, fog: true, floor: true, sceneSize: 20,
+    });
+    addLights();
+    mountThemeToggle();
+
+    const camera = new THREE.PerspectiveCamera(48, stage.clientWidth / stage.clientHeight, 0.05, 60);
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+    renderer.setSize(stage.clientWidth, stage.clientHeight);
+    stage.appendChild(renderer.domElement);
+
+    // Platform at which the triads live. A small drone marks the body so
+    // the audience reads "these axes belong to that thing" without words.
+    const root = new THREE.Group();
+    root.position.set(0, 1.4, 0);
+    scene.add(root);
+
+    const drone = createDrone({ scale: 0.9, accentColor: theme.colors.executed, showThrustVector: false });
+    // Drone is parented to the current-attitude frame so its body tilts
+    // exactly with the solid triad.
+    root.add(drone.group);
+
+    // --- Triads ----------------------------------------------------------
+    // Standard RGB / XYZ axis convention — overridden *only here* relative
+    // to the project's semantic palette because the audience reads attitude
+    // axes as RGB more readily than as our four semantic colors.
+    const AXIS_COLORS = { x: 0xff4d5d, y: 0x7aff8d, z: 0x5db0ff };
+    const AXIS_LEN = 1.0;
+
+    function makeTriad(opacity, linewidth = 1) {
+      const g = new THREE.Group();
+      const mats = [];
+      const geos = [];
+      const axes = ['x', 'y', 'z'];
+      for (const a of axes) {
+        const dir = new THREE.Vector3(a === 'x' ? 1 : 0, a === 'y' ? 1 : 0, a === 'z' ? 1 : 0);
+        const arrow = new THREE.ArrowHelper(dir, new THREE.Vector3(0, 0, 0),
+          AXIS_LEN, AXIS_COLORS[a], 0.16, 0.10);
+        arrow.line.material = new THREE.LineBasicMaterial({ color: AXIS_COLORS[a], transparent: true, opacity });
+        arrow.cone.material = new THREE.MeshBasicMaterial({ color: AXIS_COLORS[a], transparent: true, opacity });
+        mats.push(arrow.line.material, arrow.cone.material);
+        geos.push(arrow.line.geometry, arrow.cone.geometry);
+        g.add(arrow);
+      }
+      return { group: g, mats, geos };
+    }
+
+    // Current triad is parented to the body (solid). Desired triad sits in
+    // world space on `root` so its orientation is independent — users read
+    // it as "the goal these axes should meet".
+    const curTriad = makeTriad(0.95);
+    drone.group.add(curTriad.group);
+
+    const desTriad = makeTriad(0.30);
+    root.add(desTriad.group);
+
+    // --- Error arrow -----------------------------------------------------
+    // A single magenta arrow parented to root: its direction is the world-
+    // frame axis of the rotation that takes current → desired, and its
+    // length is proportional to the rotation angle.
+    const errColor = theme.colors.executed;
+    const errArrow = new THREE.ArrowHelper(
+      new THREE.Vector3(1, 0, 0), new THREE.Vector3(0, 0, 0),
+      0.001, errColor, 0.18, 0.11,
+    );
+    errArrow.line.material = new THREE.LineBasicMaterial({ color: errColor, transparent: true, opacity: 0.9 });
+    errArrow.cone.material = new THREE.MeshBasicMaterial({ color: errColor, transparent: true, opacity: 0.9 });
+    root.add(errArrow);
+
+    // --- State + control -------------------------------------------------
+    const qCur = new THREE.Quaternion();            // current orientation
+    const qDes = new THREE.Quaternion();            // desired orientation
+    const omega = new THREE.Vector3();              // body angular velocity
+    const K_R = 4.0;   // proportional gain on so(3)
+    const K_OMEGA = 2.0; // rate damping — keeps overshoot bounded
+
+    // Uniformly random unit quaternion (Shoemake).
+    function randomQuat(out) {
+      const u1 = Math.random(), u2 = Math.random(), u3 = Math.random();
+      const sq1 = Math.sqrt(1 - u1), sqr = Math.sqrt(u1);
+      out.set(
+        sq1 * Math.sin(2 * Math.PI * u2),
+        sq1 * Math.cos(2 * Math.PI * u2),
+        sqr * Math.sin(2 * Math.PI * u3),
+        sqr * Math.cos(2 * Math.PI * u3),
+      );
+      return out;
+    }
+
+    // Error quaternion q_err = q_d · q⁻¹. Returns axis-angle (axis in world
+    // frame, angle ∈ [0, π]). The sign handles q / −q being the same rotation.
+    const qErr = new THREE.Quaternion();
+    const qCurInv = new THREE.Quaternion();
+    const eVec = new THREE.Vector3();
+    function computeError() {
+      qCurInv.copy(qCur).invert();
+      qErr.multiplyQuaternions(qDes, qCurInv);
+      // Canonicalise to the short-way rotation — flip q if w < 0 so that
+      // the arrow always shows the minimum-angle path, not the 2π detour.
+      if (qErr.w < 0) { qErr.x = -qErr.x; qErr.y = -qErr.y; qErr.z = -qErr.z; qErr.w = -qErr.w; }
+      const vMag = Math.hypot(qErr.x, qErr.y, qErr.z);
+      const angle = 2 * Math.atan2(vMag, qErr.w);
+      if (vMag < 1e-9) eVec.set(1, 0, 0);
+      else eVec.set(qErr.x / vMag, qErr.y / vMag, qErr.z / vMag);
+      return { axis: eVec, angle };
+    }
+
+    // Step: ω̇ = 2·K_R · vec(q_err) − K_ω · ω (with unit inertia). Integrate ω
+    // into q_cur via a small-angle rotation.
+    const dOmega = new THREE.Vector3();
+    const dq = new THREE.Quaternion();
+    function stepDynamics(dt) {
+      const { axis, angle } = computeError();
+      // So(3) proportional term: axis × angle scaled by K_R. Uses the
+      // vec(q_err) identity that v = sin(θ/2)·n, so 2·v · K_R ≈ θ·n · K_R
+      // for small θ — good enough here and it blends smoothly at large θ.
+      dOmega.copy(axis).multiplyScalar(2 * K_R * (qErr.w >= 0 ? 1 : -1) * Math.hypot(qErr.x, qErr.y, qErr.z));
+      dOmega.addScaledVector(omega, -K_OMEGA);
+      omega.addScaledVector(dOmega, dt);
+
+      // Integrate orientation: dq ≈ [½ ω · dt, 1] normalised.
+      const w = omega, m = w.length();
+      if (m < 1e-9) return { axis, angle };
+      const theta = m * dt;
+      const s = Math.sin(theta / 2) / m;
+      dq.set(w.x * s, w.y * s, w.z * s, Math.cos(theta / 2));
+      qCur.multiplyQuaternions(dq, qCur).normalize();
+      return { axis, angle };
+    }
+
+    function resampleDesired() {
+      randomQuat(qDes);
+      desTriad.group.quaternion.copy(qDes);
+    }
+    resampleDesired();
+
+    // --- HUD -------------------------------------------------------------
+    const curPanel = createPanel({
+      title: L.currentPanel, corner: 'tl', color: 'cyan',
+      items: [
+        { key: 'roll',  label: L.rollLabel,  value: '0.0°' },
+        { key: 'pitch', label: L.pitchLabel, value: '0.0°' },
+        { key: 'yaw',   label: L.yawLabel,   value: '0.0°' },
+      ],
+    });
+    stage.appendChild(curPanel.el);
+
+    const desPanel = createPanel({
+      title: L.desiredPanel, corner: 'tr', color: 'white',
+      items: [
+        { key: 'roll',  label: L.rollLabel,  value: '0.0°' },
+        { key: 'pitch', label: L.pitchLabel, value: '0.0°' },
+        { key: 'yaw',   label: L.yawLabel,   value: '0.0°' },
+      ],
+    });
+    stage.appendChild(desPanel.el);
+
+    const errPanel = createPanel({
+      title: L.errorPanel, corner: 'bl', color: 'magenta',
+      items: [
+        { key: 'norm',  label: L.normLabel,  value: '0.00' },
+        { key: 'angle', label: L.angleLabel, value: '0.0°' },
+        { key: 'axis',  label: L.axisLabel,  value: '—' },
+      ],
+    });
+    stage.appendChild(errPanel.el);
+
+    const eTemp = new THREE.Euler();
+    // XYZ-order decomposition. We label the three components φ / θ / ψ
+    // straight off the Euler tuple — this keeps the mapping unambiguous
+    // and reinforces the teaching point: the decomposition is a chart on
+    // the manifold, not a canonical representation.
+    function quatToEulerDeg(q) {
+      eTemp.setFromQuaternion(q, 'XYZ');
+      return { roll: rad2deg(eTemp.x), pitch: rad2deg(eTemp.y), yaw: rad2deg(eTemp.z) };
+    }
+    function rad2deg(r) { return r * 180 / Math.PI; }
+
+    function setEulerPanel(panel, q) {
+      const { roll, pitch, yaw } = quatToEulerDeg(q);
+      panel.setValue('roll',  roll.toFixed(1)  + '°');
+      panel.setValue('pitch', pitch.toFixed(1) + '°');
+      panel.setValue('yaw',   yaw.toFixed(1)   + '°');
+    }
+
+    // --- Loop ------------------------------------------------------------
+    const RESAMPLE_PERIOD = 6.0;   // seconds
+    let sinceResample = 0;
+    const clock = new THREE.Clock();
+
+    (function tick() {
+      const dt = Math.min(0.05, clock.getDelta());
+
+      // Fixed sub-step to keep attitude integration well-behaved under
+      // large initial errors.
+      const SUB = 4;
+      const subDt = dt / SUB;
+      let err = null;
+      for (let i = 0; i < SUB; i++) err = stepDynamics(subDt);
+
+      // Apply current quaternion to the drone body (and hence the solid
+      // triad, which is parented to the drone).
+      drone.group.quaternion.copy(qCur);
+      drone.update(dt);
+
+      // Error arrow: direction = world-frame axis, length ∝ angle.
+      if (err.angle > 1e-4) {
+        errArrow.setDirection(err.axis);
+        errArrow.setLength(Math.max(0.05, err.angle * 0.9), 0.18, 0.11);
+        errArrow.visible = true;
+      } else {
+        errArrow.visible = false;
+      }
+
+      setEulerPanel(curPanel, qCur);
+      setEulerPanel(desPanel, qDes);
+      errPanel.setValue('norm',  err.angle.toFixed(2));
+      errPanel.setValue('angle', rad2deg(err.angle).toFixed(1) + '°');
+      errPanel.setValue('axis',
+        `(${err.axis.x.toFixed(2)}, ${err.axis.y.toFixed(2)}, ${err.axis.z.toFixed(2)})`);
+
+      // Slow orbit. Keeps both triads legible since any single fixed angle
+      // hides one or more body axes behind the drone body.
+      const t = performance.now() * 0.001;
+      const r = 4.2;
+      camera.position.set(Math.cos(t * 0.15) * r, 2.4, Math.sin(t * 0.15) * r);
+      camera.lookAt(0, 1.4, 0);
+
+      sinceResample += dt;
+      if (sinceResample > RESAMPLE_PERIOD) { resampleDesired(); sinceResample = 0; }
+
+      renderer.render(scene, camera);
+      requestAnimationFrame(tick);
+    })();
+
+    // --- Resize + dispose ------------------------------------------------
+    addEventListener('resize', () => {
+      camera.aspect = stage.clientWidth / stage.clientHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(stage.clientWidth, stage.clientHeight);
+    });
+    addEventListener('beforeunload', () => {
+      drone.dispose();
+      for (const t of [curTriad, desTriad]) {
+        for (const m of t.mats) m.dispose();
+        for (const g of t.geos) g.dispose();
+      }
+      errArrow.line.geometry.dispose();
+      errArrow.line.material.dispose();
+      errArrow.cone.geometry.dispose();
+      errArrow.cone.material.dispose();
+      curPanel.dispose(); desPanel.dispose(); errPanel.dispose();
+      disposeEnv(); renderer.dispose();
+    });
+  </script>
+</body>
+</html>
