@@ -81,6 +81,9 @@ export function createEnvironment({
   fog = true,
   floor = true,
   sceneSize = 60,
+  logoClouds = true,     // light-mode only; set false for tight framings
+                         // (e.g. orthographic side-views) where the
+                         // drifting sprites would enter frame
 } = {}) {
   // returns { scene: THREE.Scene, addLights(), dispose() }
 }
@@ -92,6 +95,9 @@ pushed out, the lighting rig flattens (no colored rim), and a `Group` of 7
 logo-sprite "clouds" drifts in a slow circle overhead at y ≈ 6–12 (textured
 from `/src/assets/logo1.png`). All of this is handled inside
 `createEnvironment` — chapters don't need to opt in. Dark mode is unchanged.
+Pass `logoClouds: false` when a chapter's visible Y range overlaps the
+6–12 m cloud band (orthographic altitude demos, any tight framing) so
+the sprites don't read as floating confetti over the subject.
 
 ### `src/kit/Trajectory.js`
 ```js
