@@ -353,15 +353,18 @@
       });
 
       // Project plate labels to screen (with an upward pixel offset so the
-      // label hovers above the plate's rim instead of bisecting it).
+      // label hovers above the plate's rim instead of bisecting it). Rounding
+      // to integer px + translate3d keeps each label on its own composition
+      // layer so the glyphs don't re-rasterize (which reads as jitter) as the
+      // camera orbits.
       const w = stage.clientWidth, h = stage.clientHeight;
       for (let i = 0; i < N_LAYERS; i++) {
         projVec.set(0, plateY(i) + 0.08, 0).project(camera);
-        const x =  (projVec.x * 0.5 + 0.5) * w;
-        const y = (-projVec.y * 0.5 + 0.5) * h - 18;
+        const x = Math.round( (projVec.x * 0.5 + 0.5) * w);
+        const y = Math.round((-projVec.y * 0.5 + 0.5) * h - 18);
         const visible = projVec.z > -1 && projVec.z < 1;
         const el = plateLabels[i];
-        el.style.transform = `translate(${x}px, ${y}px) translate(-50%, -50%)`;
+        el.style.transform = `translate3d(${x}px, ${y}px, 0) translate(-50%, -50%)`;
         el.style.opacity = visible ? '1' : '0';
         el.classList.toggle('active', i === active);
       }
