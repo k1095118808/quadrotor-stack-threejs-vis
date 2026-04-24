@@ -281,7 +281,7 @@ Only if schedule permits.
 | Ch1-1 技术栈 | 1 | ☑ | abab3df |
 | Ch1-2 频率金字塔 | 1 | ☑ | 7d5debf |
 | Ch1-3 耦合图 | 1 | ☑ | 8d3ae82 |
-| Ch2-1 爆炸视图 | 1 | ☐ | |
+| Ch2-1 爆炸视图 | 1 | ☑ | _pending_ |
 | Ch2-2 IMU 振动 | 1 | ☐ | |
 | Ch3-1 欠驱动 | 2 | ☐ | |
 | Ch3-2 PID 阶跃 | 2 | ☐ | |
@@ -363,3 +363,4 @@ export const labels = {
 - 2026-04-23 · Phase 0 complete. Kit modules, demo scene, gallery landed on `feat/phase-0-kit`.
 - 2026-04-24 · Chapter 1 complete. Autonomy-stack, frequency-pyramid, and module-coupling animations merged to main (abab3df, 7d5debf, 8d3ae82). Next: Ch2 hardware pair (exploded view + IMU vibration).
 - 2026-04-24 · Bright theme landed (d8320a9). Mode-aware `theme.js` with URL/localStorage resolution and `mountThemeToggle`; `Environment.js` gains a watermarked white floor + drifting logo-sprite clouds under `theme: 'light'`; `hud.css` carries `[data-theme="light"]` overrides and CSS var chrome. Ch1-1/2/3, `kit-demo.html`, and `index.html` retrofitted. Particle materials now fall back from `AdditiveBlending` to `NormalBlending` in light mode (additive vanishes on white).
+- 2026-04-24 · **Ch2-1 Exploded View** landed (`01-exploded.html`). Nine labeled part groups (frame, motor ×4, esc ×4, battery, fc, imu, cameras ×2, gnss, companion) built from primitives; radial/vertical explode offsets with per-part stagger; four-phase state machine (assemble → explode → hold → reform) with click-to-pause; DOM callouts carry zh bold + en monospace, projected via rounded-px translate3d per the label-jitter memory. Camera is a 50° FOV orbit at radius 5.2, lookAt y=0.3 — first pass at radius 3.6 cropped small parts (IMU especially) behind the GNSS puck, so the hold phase now pulls *out* (×1.15) instead of in.

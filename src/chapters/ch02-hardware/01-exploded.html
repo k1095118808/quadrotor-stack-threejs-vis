@@ -1,0 +1,399 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Ch2 · 四旋翼爆炸视图</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+SC:wght@300;400;500;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/src/kit/hud.css">
+  <style>
+    html, body { margin: 0; background: var(--stage-bg); overflow: hidden; }
+
+    /* Part callouts: anchored to 3D part centers. Bold zh on top, monospaced
+     * en gloss below. Updates use rounded px + translate3d (jitter memory). */
+    .part-label {
+      position: absolute;
+      top: 0; left: 0;
+      font-family: "Noto Sans SC", sans-serif;
+      color: var(--label-fg);
+      pointer-events: none;
+      padding: 3px 8px 4px;
+      border-radius: 3px;
+      background: var(--label-bg);
+      border: 0.5px solid var(--label-border);
+      letter-spacing: 0.04em;
+      line-height: 1.25;
+      text-align: center;
+      white-space: nowrap;
+      opacity: 0;
+      transition: opacity 220ms;
+      will-change: transform, opacity;
+    }
+    .part-label .zh { font-size: 12px; font-weight: 500; color: var(--label-strong-fg); }
+    .part-label .en { font-family: "JetBrains Mono", monospace; font-size: 10px; color: var(--label-fg); opacity: 0.75; margin-top: 1px; }
+
+    #hint {
+      position: absolute;
+      bottom: 16px; left: 50%; transform: translateX(-50%);
+      font-family: "Noto Sans SC", sans-serif;
+      font-size: 11px;
+      color: var(--label-fg);
+      background: var(--label-bg);
+      border: 0.5px solid var(--label-border);
+      border-radius: 3px;
+      padding: 4px 12px;
+      letter-spacing: 0.04em;
+      pointer-events: none;
+      opacity: 0.85;
+    }
+  </style>
+</head>
+<body>
+  <div id="stage" style="position:relative;width:100vw;height:100vh"></div>
+
+  <script type="module">
+    import * as THREE from 'three';
+    import { createEnvironment } from '/src/kit/Environment.js';
+    import { createPanel }       from '/src/kit/Hud.js';
+    import { labels }            from '/src/kit/labels.js';
+    import { theme, mountThemeToggle } from '/src/kit/theme.js';
+
+    // Grid stays on to anchor the model; fog off so the exploded spread
+    // doesn't fade at its extremes.
+    const { scene, addLights, dispose: disposeEnv } = createEnvironment({
+      grid: true, fog: false, floor: true, sceneSize: 20,
+    });
+    addLights();
+    mountThemeToggle();
+
+    const stage = document.getElementById('stage');
+    const camera = new THREE.PerspectiveCamera(50, stage.clientWidth / stage.clientHeight, 0.05, 50);
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setSize(stage.clientWidth, stage.clientHeight);
+    renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+    stage.appendChild(renderer.domElement);
+
+    // Components keep distinct hues so the viewer can track them through the
+    // explode sequence even when labels briefly overlap.
+    const MAT = {
+      frameBody: new THREE.MeshStandardMaterial({ color: 0x2a2f38, metalness: 0.4, roughness: 0.55 }),
+      frameArm:  new THREE.MeshStandardMaterial({ color: 0x1b1e24, metalness: 0.45, roughness: 0.6 }),
+      motor:     new THREE.MeshStandardMaterial({ color: 0x8a97ab, metalness: 0.6, roughness: 0.35 }),
+      motorCap:  new THREE.MeshStandardMaterial({ color: theme.colors.control, metalness: 0.4, roughness: 0.5 }),
+      esc:       new THREE.MeshStandardMaterial({ color: theme.colors.perception, metalness: 0.2, roughness: 0.7 }),
+      battery:   new THREE.MeshStandardMaterial({ color: 0x6b2a2a, metalness: 0.2, roughness: 0.7 }),
+      batteryStripe: new THREE.MeshStandardMaterial({ color: theme.colors.executed, metalness: 0.2, roughness: 0.5 }),
+      fc:        new THREE.MeshStandardMaterial({ color: theme.colors.executed, metalness: 0.3, roughness: 0.5 }),
+      imu:       new THREE.MeshStandardMaterial({ color: theme.colors.planning, metalness: 0.4, roughness: 0.45 }),
+      camera:    new THREE.MeshStandardMaterial({ color: 0x1a1f28, metalness: 0.5, roughness: 0.45 }),
+      cameraLens:new THREE.MeshStandardMaterial({ color: theme.colors.planning, metalness: 0.8, roughness: 0.2 }),
+      gnss:      new THREE.MeshStandardMaterial({ color: 0xdde3ec, metalness: 0.3, roughness: 0.55 }),
+      companion: new THREE.MeshStandardMaterial({ color: 0x36404e, metalness: 0.35, roughness: 0.55 }),
+    };
+    const disposables = Object.values(MAT);
+
+    // Each builder returns a THREE.Group centered on its own local origin;
+    // `home` positions it on the airframe at animate-time.
+    const ARM_LEN = 0.9;
+    const ARM_DIRS = [
+      new THREE.Vector3( 1, 0,  1).normalize(),
+      new THREE.Vector3( 1, 0, -1).normalize(),
+      new THREE.Vector3(-1, 0, -1).normalize(),
+      new THREE.Vector3(-1, 0,  1).normalize(),
+    ];
+
+    function buildFrame() {
+      const g = new THREE.Group();
+      const plate = new THREE.Mesh(new THREE.BoxGeometry(0.55, 0.08, 0.55), MAT.frameBody);
+      g.add(plate);
+      const armGeo = new THREE.CylinderGeometry(0.028, 0.028, ARM_LEN, 10);
+      for (const d of ARM_DIRS) {
+        const arm = new THREE.Mesh(armGeo, MAT.frameArm);
+        arm.position.copy(d).multiplyScalar(ARM_LEN / 2);
+        arm.rotation.z = Math.PI / 2;
+        arm.rotation.y = Math.atan2(d.z, d.x);
+        g.add(arm);
+      }
+      g.userData.geos = [plate.geometry, armGeo];
+      return g;
+    }
+    function buildMotors() {
+      const g = new THREE.Group();
+      const can = new THREE.CylinderGeometry(0.10, 0.10, 0.10, 24);
+      const cap = new THREE.CylinderGeometry(0.05, 0.05, 0.014, 20);
+      for (const d of ARM_DIRS) {
+        const sub = new THREE.Group();
+        sub.position.copy(d).multiplyScalar(ARM_LEN).setY(0.07);
+        sub.add(new THREE.Mesh(can, MAT.motor));
+        const top = new THREE.Mesh(cap, MAT.motorCap); top.position.y = 0.06; sub.add(top);
+        g.add(sub);
+      }
+      g.userData.geos = [can, cap];
+      return g;
+    }
+    function buildEscs() {
+      const g = new THREE.Group();
+      const box = new THREE.BoxGeometry(0.11, 0.035, 0.07);
+      for (const d of ARM_DIRS) {
+        const esc = new THREE.Mesh(box, MAT.esc);
+        esc.position.copy(d).multiplyScalar(ARM_LEN * 0.45).setY(-0.04);
+        esc.rotation.y = Math.atan2(d.z, d.x);
+        g.add(esc);
+      }
+      g.userData.geos = [box];
+      return g;
+    }
+    function buildBattery() {
+      const g = new THREE.Group();
+      const body = new THREE.Mesh(new THREE.BoxGeometry(0.42, 0.16, 0.22), MAT.battery);
+      const stripe = new THREE.Mesh(new THREE.BoxGeometry(0.42, 0.02, 0.04), MAT.batteryStripe);
+      stripe.position.y = 0.085;
+      g.add(body); g.add(stripe);
+      g.userData.geos = [body.geometry, stripe.geometry];
+      return g;
+    }
+    function buildFc() {
+      const g = new THREE.Group();
+      const board = new THREE.Mesh(new THREE.BoxGeometry(0.24, 0.025, 0.24), MAT.fc);
+      g.add(board);
+      g.userData.geos = [board.geometry];
+      return g;
+    }
+    function buildImu() {
+      const g = new THREE.Group();
+      const chip = new THREE.Mesh(new THREE.BoxGeometry(0.07, 0.045, 0.07), MAT.imu);
+      g.add(chip);
+      g.userData.geos = [chip.geometry];
+      return g;
+    }
+    function buildCameras() {
+      const g = new THREE.Group();
+      const body = new THREE.BoxGeometry(0.08, 0.06, 0.06);
+      const lens = new THREE.CylinderGeometry(0.022, 0.022, 0.015, 18);
+      for (const sx of [-1, 1]) {
+        const sub = new THREE.Group();
+        sub.position.set(sx * 0.085, 0, 0);
+        sub.add(new THREE.Mesh(body, MAT.camera));
+        const l = new THREE.Mesh(lens, MAT.cameraLens);
+        l.rotation.x = Math.PI / 2; l.position.z = 0.035; sub.add(l);
+        g.add(sub);
+      }
+      g.userData.geos = [body, lens];
+      return g;
+    }
+    function buildGnss() {
+      const g = new THREE.Group();
+      const puck = new THREE.Mesh(new THREE.CylinderGeometry(0.09, 0.09, 0.035, 24), MAT.gnss);
+      g.add(puck);
+      g.userData.geos = [puck.geometry];
+      return g;
+    }
+    function buildCompanion() {
+      const g = new THREE.Group();
+      const box = new THREE.Mesh(new THREE.BoxGeometry(0.20, 0.05, 0.14), MAT.companion);
+      g.add(box);
+      g.userData.geos = [box.geometry];
+      return g;
+    }
+
+    // Parts table — stagger index runs small → large, reversed on reform.
+    // The frame sits at index 8 (no offset) so the airframe settles last.
+    const V = (x, y, z) => new THREE.Vector3(x, y, z);
+    const L = labels.ch02;
+    const E = labels.ch02.exploded;
+    const PARTS = [
+      { key: 'battery',   zh: L.battery,   en: E.batteryEn,   group: buildBattery(),   home: V(0,    -0.10, 0),     offset: V(0,   -1.20, 0) },
+      { key: 'companion', zh: L.companion, en: E.companionEn, group: buildCompanion(), home: V(0,     0.08, -0.18), offset: V(0,    0.10, -1.10) },
+      { key: 'camera',    zh: L.camera,    en: E.cameraEn,    group: buildCameras(),   home: V(0,    -0.01,  0.22), offset: V(0,    0.00,  1.00) },
+      { key: 'fc',        zh: L.fc,        en: E.fcEn,        group: buildFc(),        home: V(0,     0.08,  0),    offset: V(0,    0.90,  0) },
+      { key: 'imu',       zh: L.imu,       en: E.imuEn,       group: buildImu(),       home: V(0.08,  0.12,  0.05), offset: V(1.20, 1.30,  0.05) },
+      { key: 'gnss',      zh: L.gnss,      en: E.gnssEn,      group: buildGnss(),      home: V(0,     0.13,  0),    offset: V(0,    1.90,  0) },
+      { key: 'esc',       zh: L.esc,       en: E.escEn,       group: buildEscs(),      home: V(0, 0, 0), offset: V(0, -0.55, 0) /* radial component injected per-sub-mesh below */ },
+      { key: 'motor',     zh: L.motor,     en: E.motorEn,     group: buildMotors(),    home: V(0, 0, 0), offset: V(0,  0.55, 0) /* ditto */ },
+      // Frame never moves but still needs a label. Route its callout to a
+      // fixed off-board anchor so it doesn't collide with other labels.
+      { key: 'frame',     zh: L.frame,     en: E.frameEn,     group: buildFrame(),     home: V(0, 0, 0), offset: V(0, 0, 0), labelAnchor: V(-1.1, -0.25, 0.6) },
+    ];
+
+    // For motor/esc groups the outward direction is per-sub-arm, not a single
+    // vector, so capture each sub-group's home direction once and compute its
+    // explode offset at animate-time from progress.
+    const radialChildren = [];
+    for (const p of PARTS) {
+      if (p.key === 'motor' || p.key === 'esc') {
+        p.group.children.forEach((child, i) => {
+          const dir = ARM_DIRS[i].clone();
+          radialChildren.push({ child, dir, base: child.position.clone(), key: p.key });
+        });
+      }
+    }
+
+    for (const p of PARTS) { p.group.position.copy(p.home); scene.add(p.group); }
+
+    const labelRoot = document.createElement('div');
+    labelRoot.style.cssText = 'position:absolute;inset:0;pointer-events:none;';
+    stage.appendChild(labelRoot);
+
+    const lineMat = new THREE.LineBasicMaterial({
+      color: theme.colors.planning, transparent: true, opacity: 0.0,
+    });
+    disposables.push(lineMat);
+
+    for (const p of PARTS) {
+      const el = document.createElement('div');
+      el.className = 'part-label';
+      const zh = document.createElement('div'); zh.className = 'zh'; zh.textContent = p.zh;
+      const en = document.createElement('div'); en.className = 'en'; en.textContent = p.en;
+      el.appendChild(zh); el.appendChild(en);
+      labelRoot.appendChild(el);
+      p.labelEl = el;
+
+      const geo = new THREE.BufferGeometry();
+      geo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(6), 3));
+      const line = new THREE.Line(geo, lineMat);
+      scene.add(line);
+      p.line = line;
+      p.lineGeo = geo;
+    }
+
+    const statePanel = createPanel({
+      title: E.stateTitle,
+      corner: 'tl', color: 'cyan',
+      items: [
+        { key: 'mode', label: labels.common.mode, value: E.stateAssembled },
+        { key: 'count', label: E.partCount, value: '9' },
+      ],
+    });
+    stage.appendChild(statePanel.el);
+
+    const hint = document.createElement('div');
+    hint.id = 'hint';
+    hint.textContent = E.hint;
+    stage.appendChild(hint);
+
+    // Phases drive a cumulative timer; each part has a stagger offset so the
+    // sweep reads as a sequence rather than a pop. Reform runs the stagger
+    // in reverse so the frame reseats last.
+    const PHASES = [
+      { name: 'assemble', dur: 1.2,  mode: E.stateAssembled },
+      { name: 'explode',  dur: 6.5,  mode: E.stateExplode   },
+      { name: 'hold',     dur: 4.0,  mode: E.stateHold      },
+      { name: 'reform',   dur: 5.5,  mode: E.stateReform    },
+    ];
+    const STAGGER = 0.35;     // seconds between consecutive parts
+    const PART_DUR = 1.7;     // travel duration for one part
+    let phaseIdx = 0;
+    let phaseT = 0;
+    let paused = false;
+
+    function easeInOut(u) { return u < 0.5 ? 4*u*u*u : 1 - Math.pow(-2*u + 2, 3) / 2; }
+    function clamp01(x) { return x < 0 ? 0 : x > 1 ? 1 : x; }
+
+    stage.addEventListener('click', () => {
+      paused = !paused;
+      hint.textContent = paused ? E.hintResume : E.hint;
+    });
+
+    const clock = new THREE.Clock();
+    const projVec = new THREE.Vector3();
+    const worldPos = new THREE.Vector3();
+    const anchorPos = new THREE.Vector3();
+    const N = PARTS.length;
+
+    (function tick() {
+      const dt = Math.min(0.05, clock.getDelta());
+      if (!paused) {
+        phaseT += dt;
+        if (phaseT >= PHASES[phaseIdx].dur) {
+          phaseT = 0;
+          phaseIdx = (phaseIdx + 1) % PHASES.length;
+        }
+      }
+      const phase = PHASES[phaseIdx];
+      statePanel.setValue('mode', phase.mode);
+
+      // Resolve per-part explode progress `p ∈ [0,1]`.
+      for (let i = 0; i < N; i++) {
+        const part = PARTS[i];
+        let p;
+        if (phase.name === 'assemble')      p = 0;
+        else if (phase.name === 'hold')     p = 1;
+        else if (phase.name === 'explode')  p = clamp01((phaseT - i * STAGGER) / PART_DUR);
+        else /* reform */                   p = 1 - clamp01((phaseT - (N - 1 - i) * STAGGER) / PART_DUR);
+        const e = easeInOut(p);
+        part.group.position.copy(part.home).addScaledVector(part.offset, e);
+        part.progress = e;
+      }
+
+      // Motors + ESCs need per-arm radial explosion in addition to the
+      // vertical component already baked into their group offset.
+      for (const r of radialChildren) {
+        const part = PARTS.find(pp => pp.key === r.key);
+        const e = part.progress;
+        const radial = r.key === 'motor' ? 0.75 : 0.35;
+        r.child.position.copy(r.base).addScaledVector(r.dir, e * radial);
+      }
+
+      // Callout lines: from each part's current world center to an outward
+      // "anchor" where the DOM label sits, pushed a little past the part so
+      // the label clears the geometry. Frame uses a fixed off-board anchor.
+      const W = stage.clientWidth, H = stage.clientHeight;
+      for (const part of PARTS) {
+        part.group.getWorldPosition(worldPos);
+        if (part.labelAnchor) anchorPos.copy(part.labelAnchor);
+        else anchorPos.copy(part.home).addScaledVector(part.offset, part.progress * 1.15);
+
+        const arr = part.lineGeo.attributes.position.array;
+        arr[0] = worldPos.x; arr[1] = worldPos.y; arr[2] = worldPos.z;
+        arr[3] = anchorPos.x; arr[4] = anchorPos.y; arr[5] = anchorPos.z;
+        part.lineGeo.attributes.position.needsUpdate = true;
+
+        // Label visibility ramps with the same ease so callouts fade in as
+        // the part physically separates; frame holds a steady faint label.
+        const alpha = part.key === 'frame' ? 0.7 : part.progress;
+        part.line.material.opacity = Math.min(0.55, alpha * 0.6);
+
+        projVec.copy(anchorPos).project(camera);
+        const x = Math.round( (projVec.x * 0.5 + 0.5) * W);
+        const y = Math.round((-projVec.y * 0.5 + 0.5) * H - 26);
+        const onScreen = projVec.z > -1 && projVec.z < 1;
+        part.labelEl.style.transform = `translate3d(${x}px, ${y}px, 0) translate(-50%, -50%)`;
+        part.labelEl.style.opacity = onScreen ? String(alpha).slice(0, 5) : '0';
+      }
+
+      // Camera: 3/4 orbit. Radius pulls OUT during the exploded hold so the
+      // full spread (gnss +1.9 up, battery -1.2 down, imu +1.3 out) fits the
+      // frame; smaller parts like the IMU don't clip behind the GNSS puck.
+      const t = performance.now() * 0.001;
+      const a = t * 0.22;
+      const pull = phase.name === 'hold' ? 1.15 : 1.0;
+      const radius = 5.2 * pull;
+      camera.position.set(Math.cos(a) * radius, 2.0 + 0.15 * Math.sin(a * 0.5), Math.sin(a) * radius);
+      camera.lookAt(0, 0.3, 0);
+
+      renderer.render(scene, camera);
+      requestAnimationFrame(tick);
+    })();
+
+    addEventListener('resize', () => {
+      camera.aspect = stage.clientWidth / stage.clientHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(stage.clientWidth, stage.clientHeight);
+    });
+
+    addEventListener('beforeunload', () => {
+      for (const p of PARTS) {
+        for (const geo of (p.group.userData.geos || [])) geo.dispose();
+        p.lineGeo.dispose();
+        p.labelEl.remove();
+      }
+      for (const d of disposables) d.dispose();
+      statePanel.dispose();
+      disposeEnv();
+      renderer.dispose();
+    });
+  </script>
+</body>
+</html>

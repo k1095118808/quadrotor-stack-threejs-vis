@@ -81,6 +81,29 @@ export const labels = {
     camera:    '相机',
     gnss:      'GNSS 天线',
     companion: '机载计算机',
+    exploded: {
+      // Parts carry a zh-CN name shown in the DOM callout and an EN gloss
+      // shown in monospace under it. Matches the project's "Chinese + English
+      // on first appearance" language policy.
+      partsTitle:    '组件 · 9 件',
+      stateTitle:    '状态',
+      stateAssembled: '组装',
+      stateExplode:   '展开中',
+      stateHold:      '展开保持',
+      stateReform:    '复位中',
+      hint:           '自动循环 · 点击画面暂停',
+      hintResume:     '已暂停 · 点击画面继续',
+      partCount:      '组件数',
+      frameEn:     'Frame',
+      motorEn:     'Motor ×4',
+      escEn:       'ESC ×4',
+      batteryEn:   'Battery',
+      fcEn:        'Flight Controller',
+      imuEn:       'IMU',
+      cameraEn:    'Stereo Camera',
+      gnssEn:      'GNSS Antenna',
+      companionEn: 'Companion Computer',
+    },
   },
   demo: {
     // Strings used only by src/kit-demo.html (Phase 0 acceptance test).
