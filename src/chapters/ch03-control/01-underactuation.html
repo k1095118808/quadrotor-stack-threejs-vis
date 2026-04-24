@@ -1,0 +1,443 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Ch3 · 欠驱动演示</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+SC:wght@300;400;500;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/src/kit/hud.css">
+  <style>
+    /* The underactuation demo: 6 DoF in pose vs. 4 independent inputs.
+     * Stage 1 pushes only T upward → drone lifts but cannot translate in +X
+     * (thrust is body-axial). Stage 2 applies M_pitch first, then T, so the
+     * rotated thrust has a horizontal component. Same two-stage loop every
+     * 13 s; camera is fixed 3/4 view. */
+
+    html, body { margin: 0; background: var(--stage-bg); color: var(--label-strong-fg);
+                 font-family: "Noto Sans SC", sans-serif; overflow: hidden; }
+
+    /* Phase banner: single line centered under the drone. Pulses on change. */
+    #banner {
+      position: absolute; top: 24px; left: 50%; transform: translateX(-50%);
+      font-size: 13px; font-weight: 500; letter-spacing: 0.06em;
+      color: var(--label-strong-fg);
+      background: var(--label-bg);
+      border: 0.5px solid var(--label-border);
+      border-radius: 3px;
+      padding: 6px 14px;
+      pointer-events: none;
+      opacity: 0; transition: opacity 260ms;
+    }
+
+    /* Running log: bottom-center, last 3 entries. */
+    #log {
+      position: absolute; bottom: 20px; left: 50%; transform: translateX(-50%);
+      font-family: "JetBrains Mono", monospace;
+      font-size: 11px;
+      color: var(--label-fg);
+      background: var(--label-bg);
+      border: 0.5px solid var(--label-border);
+      border-radius: 3px;
+      padding: 8px 14px;
+      min-width: 340px; max-width: 460px;
+      line-height: 1.55;
+      pointer-events: none;
+    }
+    #log .line { display: flex; gap: 8px; white-space: nowrap; }
+    #log .t    { color: var(--hud-unit); font-variant-numeric: tabular-nums; }
+    #log .tag  { color: var(--c-planning); min-width: 28px; }
+    #log .tag.fail  { color: var(--c-executed); }
+    #log .tag.ok    { color: var(--c-perception); }
+    #log .tag.goal  { color: var(--c-control); }
+    #log .msg  { color: var(--label-strong-fg); }
+    #log .line.old { opacity: 0.45; }
+
+    #hint {
+      position: absolute; bottom: 20px; right: 20px;
+      font-family: "JetBrains Mono", monospace;
+      font-size: 10px;
+      color: var(--hud-unit);
+      letter-spacing: 0.04em;
+      pointer-events: none;
+    }
+
+    /* Input indicator bars — 4 amber cells sitting above the drone in DOM.
+     * Projecting their anchor from 3D would overlap the drone geometry; a
+     * fixed top-center DOM strip reads more like a controller readout. */
+    #inputs {
+      position: absolute; top: 70px; left: 50%; transform: translateX(-50%);
+      display: flex; gap: 10px;
+      pointer-events: none;
+    }
+    .input-cell {
+      display: flex; flex-direction: column; align-items: center; gap: 4px;
+      width: 72px;
+      padding: 6px 4px 7px;
+      background: var(--label-bg);
+      border: 0.5px solid var(--label-border);
+      border-radius: 3px;
+    }
+    .input-cell .lbl { font-size: 10px; color: var(--hud-label); letter-spacing: 0.03em; }
+    .input-cell .bar {
+      width: 100%; height: 4px; border-radius: 2px;
+      background: var(--hud-divider);
+      overflow: hidden;
+    }
+    .input-cell .fill {
+      height: 100%; width: 0%;
+      background: var(--c-control);
+      transition: width 180ms ease-out;
+    }
+    .input-cell.reversed .fill { background: var(--c-planning); }
+    .input-cell .val {
+      font-family: "JetBrains Mono", monospace;
+      font-size: 10px;
+      color: var(--label-strong-fg);
+      font-variant-numeric: tabular-nums;
+    }
+  </style>
+</head>
+<body>
+  <div id="stage" style="position:relative;width:100vw;height:100vh"></div>
+  <div id="banner"></div>
+  <div id="inputs"></div>
+  <div id="log"></div>
+  <div id="hint"></div>
+
+  <script type="module">
+    import * as THREE from 'three';
+    import { createEnvironment } from '/src/kit/Environment.js';
+    import { createDrone }       from '/src/kit/Quadrotor.js';
+    import { createPanel }       from '/src/kit/Hud.js';
+    import { labels }            from '/src/kit/labels.js';
+    import { theme, mountThemeToggle } from '/src/kit/theme.js';
+
+    const L = labels.ch03.underactuation;
+    document.getElementById('hint').textContent = L.hint;
+
+    // --- Scene + camera --------------------------------------------------
+    const stage = document.getElementById('stage');
+    const { scene, addLights, dispose: disposeEnv } = createEnvironment({
+      grid: true, fog: true, floor: true, sceneSize: 24,
+    });
+    addLights();
+    mountThemeToggle();
+
+    const camera = new THREE.PerspectiveCamera(45, stage.clientWidth / stage.clientHeight, 0.05, 60);
+    camera.position.set(4.8, 3.0, 5.4);
+    camera.lookAt(0, 1.4, 0);
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setSize(stage.clientWidth, stage.clientHeight);
+    renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+    stage.appendChild(renderer.domElement);
+
+    // --- Drone + thrust vector ------------------------------------------
+    const drone = createDrone({ scale: 1.3, accentColor: theme.colors.executed, showThrustVector: true });
+    scene.add(drone.group);
+    const HOVER_Y = 1.4;
+    drone.group.position.set(0, HOVER_Y, 0);
+
+    // Ghost drone at the goal +X position — a faint stand-in that shows
+    // "this is where we're trying to end up".
+    const ghost = createDrone({ scale: 1.3, bodyColor: 0x4b5360, accentColor: 0x9aa8bc, showThrustVector: false });
+    scene.add(ghost.group);
+    const GOAL_X = 2.2;
+    ghost.group.position.set(GOAL_X, HOVER_Y, 0);
+    ghost.group.traverse((o) => {
+      if (o.isMesh) {
+        o.material = o.material.clone();
+        o.material.transparent = true;
+        o.material.opacity = 0.18;
+        o.material.depthWrite = false;
+      }
+    });
+
+    // --- 6 DoF indicators --------------------------------------------------
+    // Translation: three bi-directional arrow pairs along world X/Y/Z.
+    // Rotation: three torus arcs around the same axes. Everything parented
+    // to the drone so it tracks the body while tilted.
+    const dofRoot = new THREE.Group();
+    drone.group.add(dofRoot);
+
+    const transMats = {
+      x: new THREE.MeshBasicMaterial({ color: 0xd97c7c, transparent: true, opacity: 0.55 }),
+      y: new THREE.MeshBasicMaterial({ color: 0x9ed97c, transparent: true, opacity: 0.55 }),
+      z: new THREE.MeshBasicMaterial({ color: 0x7cbcd9, transparent: true, opacity: 0.55 }),
+    };
+    function makeAxisArrow(axis, sign) {
+      const dir = new THREE.Vector3(
+        axis === 'x' ? sign : 0,
+        axis === 'y' ? sign : 0,
+        axis === 'z' ? sign : 0,
+      );
+      const arrow = new THREE.ArrowHelper(dir, new THREE.Vector3(0, 0, 0), 0.95, 0xffffff, 0.14, 0.09);
+      arrow.line.material = transMats[axis];
+      arrow.cone.material = transMats[axis];
+      return arrow;
+    }
+    for (const axis of ['x', 'y', 'z']) {
+      dofRoot.add(makeAxisArrow(axis, +1));
+      dofRoot.add(makeAxisArrow(axis, -1));
+    }
+
+    // Rotation arcs: 3/4 of a torus around each axis, colored same as its
+    // translation pair so viewer reads the pairing (e.g. "X lateral & roll").
+    const rotMats = {
+      x: new THREE.MeshBasicMaterial({ color: 0xd97c7c, transparent: true, opacity: 0.45 }),
+      y: new THREE.MeshBasicMaterial({ color: 0x9ed97c, transparent: true, opacity: 0.45 }),
+      z: new THREE.MeshBasicMaterial({ color: 0x7cbcd9, transparent: true, opacity: 0.45 }),
+    };
+    function makeRotArc(axis) {
+      const geo = new THREE.TorusGeometry(0.78, 0.010, 6, 48, Math.PI * 1.5);
+      const mesh = new THREE.Mesh(geo, rotMats[axis]);
+      if (axis === 'x') mesh.rotation.y = Math.PI / 2;  // plane y-z
+      if (axis === 'y') mesh.rotation.x = Math.PI / 2;  // plane x-z
+      // axis === 'z' stays in xy-plane (default torus)
+      return { mesh, geo };
+    }
+    const rotArcs = [];
+    for (const a of ['x', 'y', 'z']) {
+      const r = makeRotArc(a);
+      dofRoot.add(r.mesh);
+      rotArcs.push(r);
+    }
+
+    // Strike-through marker shown over the ±X arrow during the Stage-1 fail.
+    const strikeMat = new THREE.LineBasicMaterial({ color: theme.colors.executed, transparent: true, opacity: 0.0 });
+    const strikeGeo = new THREE.BufferGeometry().setFromPoints([
+      new THREE.Vector3(-1.1, -0.35, 0), new THREE.Vector3(1.1, 0.35, 0),
+    ]);
+    const strike = new THREE.Line(strikeGeo, strikeMat);
+    drone.group.add(strike);
+
+    // --- HUD panels ------------------------------------------------------
+    // Totals live in the panel title ("自由度 · 6") so the 6 vs 4 contrast
+     // is visible in a glance; the per-row values below give live readouts.
+    const dofPanel = createPanel({
+      title: `${L.dofPanel} · ${L.dofCount}`, corner: 'tl', color: 'cyan',
+      items: [
+        { key: 'tx',    label: L.dofTransX, value: '—' },
+        { key: 'ty',    label: L.dofTransY, value: '—' },
+        { key: 'tz',    label: L.dofTransZ, value: '—' },
+        { key: 'rr',    label: L.dofRotRoll,  value: '—' },
+        { key: 'rp',    label: L.dofRotPitch, value: '—' },
+        { key: 'ry',    label: L.dofRotYaw,   value: '—' },
+      ],
+    });
+    stage.appendChild(dofPanel.el);
+
+    const inputPanel = createPanel({
+      title: `${L.inputPanel} · ${L.inputCount}`, corner: 'tr', color: 'amber',
+      items: [
+        { key: 'T',   label: L.inputThrust, value: '0.00' },
+        { key: 'Mr',  label: L.inputMRoll,  value: '0.00' },
+        { key: 'Mp',  label: L.inputMPitch, value: '0.00' },
+        { key: 'My',  label: L.inputMYaw,   value: '0.00' },
+      ],
+    });
+    stage.appendChild(inputPanel.el);
+
+    // --- Input-bar strip (DOM) ------------------------------------------
+    const INPUT_SPEC = [
+      { key: 'T',  lbl: 'T',  name: L.inputThrust },
+      { key: 'Mr', lbl: 'Mφ', name: L.inputMRoll  },
+      { key: 'Mp', lbl: 'Mθ', name: L.inputMPitch },
+      { key: 'My', lbl: 'Mψ', name: L.inputMYaw   },
+    ];
+    const inputsRoot = document.getElementById('inputs');
+    const inputCells = {};
+    for (const spec of INPUT_SPEC) {
+      const cell = document.createElement('div');
+      cell.className = 'input-cell';
+      const lab = document.createElement('div'); lab.className = 'lbl'; lab.textContent = spec.lbl;
+      const bar = document.createElement('div'); bar.className = 'bar';
+      const fill = document.createElement('div'); fill.className = 'fill';
+      bar.appendChild(fill);
+      const val = document.createElement('div'); val.className = 'val'; val.textContent = '0.00';
+      cell.appendChild(lab); cell.appendChild(bar); cell.appendChild(val);
+      inputsRoot.appendChild(cell);
+      inputCells[spec.key] = { cell, fill, val };
+    }
+
+    // --- Log ring buffer -------------------------------------------------
+    const logRoot = document.getElementById('log');
+    const LOG_KEEP = 4;
+    const logLines = [];
+    function pushLog(tag, msg, tagClass = '') {
+      const line = document.createElement('div');
+      line.className = 'line';
+      const t = document.createElement('span'); t.className = 't';
+      const secs = (performance.now() * 0.001 - loopStart) % 13;
+      t.textContent = `[${secs.toFixed(1).padStart(4, '0')}s]`;
+      const tagEl = document.createElement('span'); tagEl.className = 'tag' + (tagClass ? ' ' + tagClass : '');
+      tagEl.textContent = tag;
+      const msgEl = document.createElement('span'); msgEl.className = 'msg';
+      msgEl.textContent = msg;
+      line.appendChild(t); line.appendChild(tagEl); line.appendChild(msgEl);
+      logRoot.appendChild(line);
+      logLines.push(line);
+      while (logLines.length > LOG_KEEP) logLines.shift().remove();
+      for (let i = 0; i < logLines.length - 1; i++) logLines[i].classList.add('old');
+    }
+
+    // --- Phase machine ---------------------------------------------------
+    // A phase has: enter() to stamp log/banner, update(t) where t is the
+    // seconds elapsed within the phase, and a duration. Transitions happen
+    // when elapsed ≥ dur. On loop wrap, state (position, rotation) resets.
+    const banner = document.getElementById('banner');
+    function setBanner(text) {
+      banner.textContent = text;
+      banner.style.opacity = text ? '0.95' : '0';
+    }
+
+    const PHASES = [
+      { name: 'idle',       dur: 1.0, banner: '',
+        enter() { pushLog(L.goalTag, L.goalLateral, 'goal'); setBanner(''); },
+        update() { setInputs({ T: 0.55, Mr: 0, Mp: 0, My: 0 }); }, },
+      { name: 's1_attempt', dur: 3.0, banner: L.stage1Title,
+        enter() { pushLog(L.tryTag, L.tryThrustOnly); setBanner(L.stage1Title); },
+        update(t) {
+          // Thrust ramps up; no moments. Drone lifts slightly above hover.
+          const u = Math.min(1, t / 1.4);
+          setInputs({ T: 0.55 + 0.40 * u, Mr: 0, Mp: 0, My: 0 });
+          drone.group.position.y = HOVER_Y + 0.35 * u;
+          drone.group.position.x = 0;                // stays put laterally
+          drone.group.rotation.set(0, 0, 0);
+        }, },
+      { name: 's1_fail',    dur: 1.0, banner: L.stage1Title,
+        enter() { pushLog(L.resultTag, L.failInfeasible, 'fail'); },
+        update(t) {
+          // Flash strike. Drone settles back toward hover altitude.
+          strike.material.opacity = 0.55 + 0.35 * Math.sin(t * 14);
+          const u = Math.min(1, t / 0.8);
+          drone.group.position.y = HOVER_Y + 0.35 * (1 - u);
+          setInputs({ T: 0.55, Mr: 0, Mp: 0, My: 0 });
+        },
+        exit() { strike.material.opacity = 0.0; }, },
+      { name: 's2_pitch',   dur: 1.6, banner: L.stage2Title,
+        enter() { pushLog(L.tryTag, L.pitchTilt); setBanner(L.stage2Title); },
+        update(t) {
+          // M_pitch applied (positive): drone rotates about world Z, thrust
+          // direction tilts toward +X. Angle ramps from 0 → target over ~1s.
+          const u = easeInOut(Math.min(1, t / 1.2));
+          drone.group.rotation.z = -TILT_MAX * u;
+          setInputs({ T: 0.55, Mr: 0, Mp: 0.55, My: 0 });
+        }, },
+      { name: 's2_accel',   dur: 2.6, banner: L.stage2Title,
+        enter() { pushLog(L.tryTag, L.thrustTilt); },
+        update(t) {
+          // Moment goes idle (attitude held); thrust raised above hover. Under
+          // simple ballistic kinematics the drone accelerates in +X, but we
+          // pre-plan the position curve so it arrives at GOAL_X exactly.
+          const u = easeInOut(Math.min(1, t / 2.4));
+          drone.group.position.x = GOAL_X * u;
+          drone.group.position.y = HOVER_Y + 0.05 * Math.sin(u * Math.PI);
+          drone.group.rotation.z = -TILT_MAX;
+          setInputs({ T: 0.92, Mr: 0, Mp: 0.12, My: 0 });
+        }, },
+      { name: 's2_level',   dur: 1.6, banner: L.stage2Title,
+        enter() { pushLog(L.tryTag, L.levelOff); },
+        update(t) {
+          // Reverse moment brings pitch back to level.
+          const u = easeInOut(Math.min(1, t / 1.4));
+          drone.group.rotation.z = -TILT_MAX * (1 - u);
+          drone.group.position.x = GOAL_X;
+          setInputs({ T: 0.70, Mr: 0, Mp: -0.55, My: 0 });
+        }, },
+      { name: 's2_ok',      dur: 2.2, banner: L.stage2Title,
+        enter() { pushLog(L.resultTag, L.succeed, 'ok'); },
+        update() {
+          setInputs({ T: 0.55, Mr: 0, Mp: 0, My: 0 });
+          drone.group.rotation.set(0, 0, 0);
+        }, },
+    ];
+    const TILT_MAX = 0.22; // ≈ 12.6°
+
+    function easeInOut(u) { return u < 0.5 ? 4*u*u*u : 1 - Math.pow(-2*u + 2, 3) / 2; }
+
+    function setInputs({ T, Mr, Mp, My }) {
+      const values = { T, Mr, Mp, My };
+      for (const k of Object.keys(values)) {
+        const v = Math.max(-1, Math.min(1, values[k]));
+        const cell = inputCells[k];
+        cell.fill.style.width = (Math.abs(v) * 100).toFixed(0) + '%';
+        cell.cell.classList.toggle('reversed', v < 0);
+        cell.val.textContent = v.toFixed(2);
+        inputPanel.setValue(k, v.toFixed(2));
+      }
+    }
+
+    // Mirror the live pose back to the DoF panel so the viewer sees which
+    // DoFs are actually moving at any instant.
+    function updateDofReadout() {
+      const p = drone.group.position;
+      const r = drone.group.rotation;
+      dofPanel.setValue('tx', p.x.toFixed(2));
+      dofPanel.setValue('ty', (p.y - HOVER_Y).toFixed(2));
+      dofPanel.setValue('tz', p.z.toFixed(2));
+      dofPanel.setValue('rr', r.x.toFixed(2));
+      dofPanel.setValue('rp', r.z.toFixed(2));  // Three.js Z-rotation ≈ pitch under our convention
+      dofPanel.setValue('ry', r.y.toFixed(2));
+    }
+
+    // --- Loop driver -----------------------------------------------------
+    let phaseIdx = 0;
+    let phaseElapsed = 0;
+    let loopStart = performance.now() * 0.001;
+    PHASES[0].enter();
+
+    function resetLoop() {
+      drone.group.position.set(0, HOVER_Y, 0);
+      drone.group.rotation.set(0, 0, 0);
+      strike.material.opacity = 0.0;
+      loopStart = performance.now() * 0.001;
+      logLines.splice(0).forEach((l) => l.remove());
+    }
+
+    const clock = new THREE.Clock();
+    (function tick() {
+      const dt = Math.min(0.05, clock.getDelta());
+      phaseElapsed += dt;
+
+      let phase = PHASES[phaseIdx];
+      while (phaseElapsed >= phase.dur) {
+        phase.exit?.();
+        phaseElapsed -= phase.dur;
+        phaseIdx++;
+        if (phaseIdx >= PHASES.length) {
+          phaseIdx = 0;
+          resetLoop();
+        }
+        phase = PHASES[phaseIdx];
+        phase.enter();
+      }
+      phase.update(phaseElapsed);
+
+      drone.update(dt);
+      updateDofReadout();
+
+      renderer.render(scene, camera);
+      requestAnimationFrame(tick);
+    })();
+
+    // --- Resize + dispose ------------------------------------------------
+    addEventListener('resize', () => {
+      camera.aspect = stage.clientWidth / stage.clientHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(stage.clientWidth, stage.clientHeight);
+    });
+    addEventListener('beforeunload', () => {
+      drone.dispose();
+      ghost.dispose();
+      Object.values(transMats).forEach(m => m.dispose());
+      Object.values(rotMats).forEach(m => m.dispose());
+      rotArcs.forEach(r => r.geo.dispose());
+      strikeGeo.dispose(); strikeMat.dispose();
+      dofPanel.dispose(); inputPanel.dispose();
+      disposeEnv(); renderer.dispose();
+    });
+  </script>
+</body>
+</html>
