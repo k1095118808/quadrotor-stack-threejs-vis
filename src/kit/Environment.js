@@ -13,6 +13,9 @@ export function createEnvironment({
   fog = true,
   floor = true,
   sceneSize = 60,
+  logoClouds = true,          // light-mode only; set false for tight framings
+                              // (e.g. orthographic side-views) where the
+                              // drifting sprites would enter frame.
 } = {}) {
   const scene = new THREE.Scene();
   const disposables = [];
@@ -78,7 +81,7 @@ export function createEnvironment({
   // Light-mode only: a handful of logo "clouds" drifting high above the scene.
   // Dark mode already has a strong mood from fog + particles; adding floating
   // branding there would fight the neon aesthetic.
-  if (isLight) {
+  if (isLight && logoClouds) {
     const clouds = addLogoClouds(scene, sceneSize);
     disposables.push(clouds.texture, clouds.material);
   }

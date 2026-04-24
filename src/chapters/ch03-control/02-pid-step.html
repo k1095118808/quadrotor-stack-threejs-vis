@@ -185,7 +185,11 @@
     // --- 3D side-view ----------------------------------------------------
     const stage = document.getElementById('stage');
     const { scene, addLights, dispose: disposeEnv } = createEnvironment({
-      grid: true, fog: false, floor: true, sceneSize: 20,
+      // Orthographic side-view: the bright-theme logo clouds drift at
+      // y = 6–12, which is inside our visible Y range [−0.5, 8.5] and would
+      // read as floating confetti over the altitude plot. Opt out here —
+      // other chapters still get the clouds.
+      grid: true, fog: false, floor: true, sceneSize: 20, logoClouds: false,
     });
     addLights();
     mountThemeToggle();
