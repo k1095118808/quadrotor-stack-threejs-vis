@@ -75,7 +75,8 @@ The returned `update(dt)` spins rotors counter-rotating in pairs. `setThrust` sc
 ### `src/kit/Environment.js`
 ```js
 export function createEnvironment({
-  theme = 'dark',        // 'dark' | 'studio'
+  theme = theme.mode,    // 'dark' | 'light' | 'studio' — default reads the
+                         // mode theme.js resolved at load time
   grid = true,
   fog = true,
   floor = true,
@@ -84,6 +85,13 @@ export function createEnvironment({
   // returns { scene: THREE.Scene, addLights(), dispose() }
 }
 ```
+
+In `'light'` mode the floor is painted with a baked `CanvasTexture` of
+repeating "EXAMPLE TEXTS" copies in a deep purple/pink, the fog far plane is
+pushed out, the lighting rig flattens (no colored rim), and a `Group` of 7
+logo-sprite "clouds" drifts in a slow circle overhead at y ≈ 6–12 (textured
+from `/src/assets/logo1.png`). All of this is handled inside
+`createEnvironment` — chapters don't need to opt in. Dark mode is unchanged.
 
 ### `src/kit/Trajectory.js`
 ```js
@@ -129,31 +137,39 @@ export function cinematic(camera, keyframes) { }  // array of { time, position, 
 ```
 
 ### `src/kit/theme.js`
-Single export object. Everything visual must pull from here.
+Single source of truth for all visual tokens. The exported `theme` object is
+**mode-aware** — its `colors`, `hud`, and the sibling `hudAccents` export are
+selected from a dark or light palette at module-load time. Chapter code reads
+`theme.colors.planning` etc. as before; slot names are identical across modes,
+only the RGB values shift.
+
 ```js
 export const theme = {
-  colors: {
-    bg:        0x07090d,
-    grid:      0x1a3350,
-    perception:0x5dffb1,  // green
-    planning:  0x5dd3ff,  // cyan
-    control:   0xffb454,  // amber
-    executed:  0xff3366,  // magenta
-    obstacle:  0x3a4354,
-    waypoint:  0x5dd3ff,
-  },
-  fonts: {
-    sans: '"Noto Sans SC", sans-serif',
-    mono: '"JetBrains Mono", monospace',
-  },
-  hud: {
-    bg:     'rgba(7,9,13,0.75)',
-    border: '0.5px solid rgba(255,255,255,0.15)',
-    radius: '6px',
-    pad:    '8px 12px',
-  },
+  mode: 'dark' | 'light',     // resolved at import; frozen for the page
+  colors: { bg, grid, perception, planning, control, executed, obstacle, waypoint },
+  fonts:  { sans, mono },
+  hud:    { bg, border, radius, pad },
 };
+export const hudAccents = { green, cyan, amber, magenta, white };
+export function hexToCss(hex)            { /* 0xRRGGBB → '#rrggbb' */ }
+export function getThemeMode()           { /* 'dark' | 'light' */ }
+export function setThemeMode(mode)       { /* persist + reload */ }
+export function mountThemeToggle(host?)  { /* ☾/☀ chip, fixed bottom-right */ }
 ```
+
+**Mode resolution** (once, at import) in priority order:
+1. `?theme=light|dark` URL query param
+2. `localStorage['vis-theme']`
+3. `'dark'` (default)
+
+On import, theme.js applies `<html data-theme="…">` and a `--stage-bg` CSS var
+so `hud.css` and per-chapter inline styles can key off theme without any JS
+plumbing. `setThemeMode()` persists to localStorage and reloads — materials
+are baked at scene construction, so hot-swapping would require every chapter
+to walk its object tree. The reload is intentional.
+
+Every animation must call `mountThemeToggle()` once during setup so the user
+can flip modes from inside a chapter, not just from the gallery.
 
 ## Animation file template
 
@@ -177,11 +193,12 @@ Every chapter HTML file follows this shape:
     import { createPanel }       from '/src/kit/Hud.js';
     import { orbitCamera }       from '/src/kit/CameraRig.js';
     import { labels }            from '/src/kit/labels.js';
-    import { theme }             from '/src/kit/theme.js';
+    import { theme, mountThemeToggle } from '/src/kit/theme.js';
 
-    // 1. scene
-    const { scene, addLights } = createEnvironment({ theme: 'dark' });
+    // 1. scene — omit `theme:` so Environment.js reads the resolved mode.
+    const { scene, addLights } = createEnvironment({});
     addLights();
+    mountThemeToggle();
 
     // 2. camera + renderer
     const stage = document.getElementById('stage');
@@ -233,6 +250,28 @@ Target size per animation file: **under 400 lines**. If it's creeping past that,
 - **Grid floor** everywhere — it's the visual anchor that tells viewers "this is a 3D scene."
 - **Labels in Chinese** appear as DOM overlays, never as 3D text (3D Chinese text rendering is a rabbit hole).
 
+### Optional bright theme
+
+A true-white "paper" variant ships alongside the dark scene. Activated by
+`?theme=light`, a localStorage preference, or the floating ☾/☀ toggle that
+every page mounts via `mountThemeToggle()`. Design notes:
+
+- **Floor** carries a deep purple/pink "EXAMPLE TEXTS" watermark baked as a
+  `CanvasTexture`. `index.html` mirrors it as an inline-SVG body background.
+- **Logo clouds.** Seven `THREE.Sprite` copies of `/src/assets/logo1.png`
+  drift overhead at y ≈ 6–12 in a slow circle. Light-mode only.
+- **Palette** keeps all slot names but swaps in darker, more saturated RGB
+  values — the dark neons wash out against white. HUD panel bg/border also
+  flip so dark text reads on a translucent-white panel.
+- **Blending gotcha.** `THREE.AdditiveBlending` particles *vanish* against
+  white. For any particle/glow material, fall back to `NormalBlending` when
+  `theme.mode === 'light'` (see ch01-1 uplink/downlink streams for the
+  pattern).
+- Semantic accent CSS vars (`--c-perception`, `--c-planning`, `--c-control`,
+  `--c-executed`) are defined per-theme in `hud.css`, so chapter stylesheets
+  that want an active-state tint use `var(--c-perception)` rather than a
+  literal hex.
+
 ## Three.js conventions and gotchas
 
 - Pre-allocate `BufferGeometry` for trails: create once with a fixed capacity, use `setDrawRange` + `attributes.position.needsUpdate = true`. Calling `setFromPoints` every frame will crash on a long trail.
@@ -241,6 +280,11 @@ Target size per animation file: **under 400 lines**. If it's creeping past that,
 - Camera `updateProjectionMatrix()` after any aspect change. Easy to forget.
 - `THREE.CapsuleGeometry` is fine in modern Three but **does not exist in r128** — irrelevant now that we're on latest, but worth knowing if you ever look at the earlier CDN-based prototype.
 - **Projected DOM labels must be pixel-quantized.** When you compute an overlay's screen position from `vec.project(camera)` and update it per frame, use `Math.round()` on both px coords and write the transform as `translate3d(x, y, 0)` — not `translate(x, y)`. Fractional 2D translates keep the glyphs in the main compositing pass and they re-rasterize at slightly different sub-positions every frame, which reads as jitter. Also set `will-change: transform` on the label class. Applies to plate/node/callout labels in Ch1-1, Ch1-3, and any future CSS2DRenderer-style Ch2 exploded-view callouts.
+- **Additive blending vanishes on white.** `THREE.AdditiveBlending` adds RGB toward 1.0, so bright particles disappear against the light theme's white bg. Gate the blending mode on `theme.mode` and fall back to `THREE.NormalBlending` in light mode. Checked pattern:
+  ```js
+  blending: theme.mode === 'light' ? THREE.NormalBlending : THREE.AdditiveBlending,
+  ```
+- **Per-chapter inline `<style>` must key off CSS vars**, not hex literals. Use `var(--stage-bg)` instead of `#07090d` for html/body, `var(--label-fg/bg/border)` for projected labels, `var(--hud-divider)` for dashed separators, and `var(--c-perception/planning/control/executed)` for semantic accents. The vars are defined per-theme in `hud.css`.
 
 ## Workflow
 
@@ -259,5 +303,6 @@ Target size per animation file: **under 400 lines**. If it's creeping past that,
 
 ## Files to never touch without explicit permission
 
-- `src/kit/theme.js` — changing colors here cascades to every animation. Treat as frozen after Phase 1 unless the user requests a palette overhaul.
+- `src/kit/theme.js` — changing colors here cascades to every animation. Intentionally overhauled on 2026-04-24 to add the bright theme and mode-switching helpers; frozen again unless the user requests a further palette-level change.
 - `src/kit/labels.js` — same logic. Chinese copy should be reviewed together, not changed mid-stream.
+- `src/assets/logo1.png` — used by the bright theme's logo clouds. Replacing it is fine, but check the aspect ratio: `addLogoClouds()` auto-corrects sprite scale from the decoded image, so non-3:1 logos will change the visible cloud footprint.

@@ -1,16 +1,70 @@
 /* HUD base styles. All HUDs overlay a positioned container (usually #stage).
- * Per-instance color is driven by a --hud-accent CSS custom property set on
- * the root element by Hud.js based on theme.hudAccents. Colors, fonts, and
+ * Per-instance accent color is driven by a --hud-accent CSS custom property
+ * set on the root element by Hud.js based on theme.hudAccents. Per-theme
+ * chrome (panel bg / border, page bg, floating label colors) is driven by
+ * the [data-theme] attribute theme.js applies to <html>. Colors, fonts, and
  * spacing tokens mirror src/kit/theme.js — do not add new hex values here. */
 
+:root {
+  /* Dark (default). Overridden by [data-theme="light"] below. */
+  --stage-bg:        #07090d;
+  --hud-bg:          rgba(7, 9, 13, 0.75);
+  --hud-border:      rgba(255, 255, 255, 0.15);
+  --hud-label:       rgba(232, 236, 242, 0.65);
+  --hud-unit:        rgba(232, 236, 242, 0.45);
+  --hud-divider:     rgba(255, 255, 255, 0.08);
+
+  /* Floating 3D-anchored labels (plate / node / hint rings in ch01). */
+  --label-fg:        rgba(232, 236, 242, 0.62);
+  --label-bg:        rgba(7, 9, 13, 0.55);
+  --label-border:    rgba(255, 255, 255, 0.10);
+  --label-strong-fg: rgba(232, 236, 242, 0.78);
+
+  /* Toggle chip. */
+  --toggle-fg:       rgba(232, 236, 242, 0.80);
+  --toggle-bg:       rgba(7, 9, 13, 0.70);
+  --toggle-border:   rgba(255, 255, 255, 0.18);
+
+  /* Semantic accents (mirror theme.colors) — per-theme so chapter CSS can
+   * reference them without round-tripping through JS. */
+  --c-perception:    #5dffb1;
+  --c-planning:      #5dd3ff;
+  --c-control:       #ffb454;
+  --c-executed:      #ff3366;
+}
+
+[data-theme="light"] {
+  --stage-bg:        #ffffff;
+  --hud-bg:          rgba(255, 255, 255, 0.88);
+  --hud-border:      rgba(0, 0, 0, 0.12);
+  --hud-label:       rgba(26, 35, 50, 0.70);
+  --hud-unit:        rgba(26, 35, 50, 0.50);
+  --hud-divider:     rgba(0, 0, 0, 0.08);
+
+  --label-fg:        rgba(26, 35, 50, 0.80);
+  --label-bg:        rgba(255, 255, 255, 0.85);
+  --label-border:    rgba(0, 0, 0, 0.12);
+  --label-strong-fg: rgba(26, 35, 50, 0.92);
+
+  --toggle-fg:       rgba(26, 35, 50, 0.85);
+  --toggle-bg:       rgba(255, 255, 255, 0.90);
+  --toggle-border:   rgba(0, 0, 0, 0.15);
+
+  --c-perception:    #00a061;
+  --c-planning:      #0f87b8;
+  --c-control:       #c57600;
+  --c-executed:      #d9124d;
+}
+
+/* Panels + charts share chrome. */
 .hud-panel,
 .hud-chart {
   position: absolute;
   font-family: "JetBrains Mono", monospace;
   font-size: 11px;
-  color: var(--hud-accent, #e8ecf2);
-  background: rgba(7, 9, 13, 0.75);
-  border: 0.5px solid rgba(255, 255, 255, 0.15);
+  color: var(--hud-accent, var(--label-strong-fg));
+  background: var(--hud-bg);
+  border: 0.5px solid var(--hud-border);
   border-radius: 6px;
   padding: 8px 12px;
   pointer-events: none;
@@ -31,10 +85,10 @@
   font-family: "Noto Sans SC", sans-serif;
   font-size: 12px;
   font-weight: 500;
-  color: var(--hud-accent, #e8ecf2);
+  color: var(--hud-accent, var(--label-strong-fg));
   margin-bottom: 6px;
   padding-bottom: 4px;
-  border-bottom: 0.5px solid rgba(255, 255, 255, 0.08);
+  border-bottom: 0.5px solid var(--hud-divider);
   letter-spacing: 0.04em;
 }
 
@@ -48,17 +102,17 @@
 
 .hud-panel .hud-label {
   font-family: "Noto Sans SC", sans-serif;
-  color: rgba(232, 236, 242, 0.65);
+  color: var(--hud-label);
   font-size: 11px;
 }
 
 .hud-panel .hud-value {
-  color: var(--hud-accent, #e8ecf2);
+  color: var(--hud-accent, var(--label-strong-fg));
   font-variant-numeric: tabular-nums;
 }
 
 .hud-panel .hud-unit {
-  color: rgba(232, 236, 242, 0.45);
+  color: var(--hud-unit);
   font-size: 10px;
   margin-left: 3px;
 }
@@ -70,11 +124,46 @@
 .hud-chart .hud-chart-title {
   font-family: "Noto Sans SC", sans-serif;
   font-size: 11px;
-  color: var(--hud-accent, #e8ecf2);
+  color: var(--hud-accent, var(--label-strong-fg));
   margin-bottom: 4px;
   letter-spacing: 0.04em;
   opacity: 0.85;
 }
 .hud-chart canvas {
   display: block;
+}
+
+/* Theme toggle chip. Fixed bottom-right of the viewport so it never fights
+ * per-chapter HUD corners. Kept small and monochrome to stay out of the way. */
+.theme-toggle {
+  position: fixed;
+  bottom: 16px;
+  right: 16px;
+  width: 32px;
+  height: 32px;
+  border-radius: 50%;
+  padding: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-family: "JetBrains Mono", monospace;
+  font-size: 15px;
+  line-height: 1;
+  color: var(--toggle-fg);
+  background: var(--toggle-bg);
+  border: 0.5px solid var(--toggle-border);
+  backdrop-filter: blur(2px);
+  -webkit-backdrop-filter: blur(2px);
+  cursor: pointer;
+  z-index: 100;
+  transition: transform 120ms ease, border-color 120ms ease, color 120ms ease;
+}
+.theme-toggle:hover {
+  transform: scale(1.08);
+  border-color: var(--hud-accent, var(--toggle-fg));
+  color: var(--hud-accent, var(--toggle-fg));
+}
+.theme-toggle:focus-visible {
+  outline: 1px solid var(--hud-accent, var(--toggle-fg));
+  outline-offset: 2px;
 }

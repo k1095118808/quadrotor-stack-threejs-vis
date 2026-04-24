@@ -124,8 +124,10 @@ export function createChart({
 
     ctx.clearRect(0, 0, width, height);
 
-    // Baseline grid at midpoint.
-    ctx.strokeStyle = 'rgba(255,255,255,0.08)';
+    // Baseline grid at midpoint. Pulled from the theme-aware --hud-divider
+    // var so it stays visible under both light and dark palettes.
+    const divider = getComputedStyle(el).getPropertyValue('--hud-divider').trim();
+    ctx.strokeStyle = divider || 'rgba(255,255,255,0.08)';
     ctx.lineWidth = 0.5;
     ctx.beginPath();
     ctx.moveTo(0, height / 2);

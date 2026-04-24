@@ -44,8 +44,9 @@ Produce a web-based presentation that introduces research newcomers to quadrotor
 - [x] Implement `src/kit/Hud.js` + `hud.css`
 - [x] Reference scene `src/kit-demo.html` exercising every kit module (this is the acceptance test)
 - [x] Root `index.html` gallery page listing every animation
+- [x] Bright theme (2026-04-24): light palette + toggle helpers in `theme.js`, white/watermarked floor + logo-sprite clouds in `Environment.js`, `[data-theme="light"]` overrides + CSS var chrome in `hud.css`. Retrofitted Ch1-1/2/3, `kit-demo.html`, and `index.html`. See CLAUDE.md "Optional bright theme" for the design notes and gotchas.
 
-**Acceptance:** open `src/kit-demo.html` in the browser, see a drone on a grid flying a loop through obstacles with a LIDAR fan, a camera frustum, a trail, two HUD panels, and one altitude chart. Looks like the prototype from earlier in the conversation.
+**Acceptance:** open `src/kit-demo.html` in the browser, see a drone on a grid flying a loop through obstacles with a LIDAR fan, a camera frustum, a trail, two HUD panels, and one altitude chart. Looks like the prototype from earlier in the conversation. Clicking the ☾/☀ chip in the bottom-right should flip to the bright variant with the watermarked floor and drifting logo clouds.
 
 ### Phase 1 — Headline chapters (Week 2)
 - [x] Ch1 P0×2 + P1×1
@@ -276,6 +277,7 @@ Only if schedule permits.
 | Animation | Phase | Status | Commit |
 |---|---|---|---|
 | Kit + theme + demo | 0 | ☑ | feat/phase-0-kit |
+| Bright theme + logo clouds | 0 | ☑ | (pending) |
 | Ch1-1 技术栈 | 1 | ☑ | abab3df |
 | Ch1-2 频率金字塔 | 1 | ☑ | 7d5debf |
 | Ch1-3 耦合图 | 1 | ☑ | 8d3ae82 |
@@ -360,3 +362,4 @@ export const labels = {
 - 2026-04-23 · Initial plan.
 - 2026-04-23 · Phase 0 complete. Kit modules, demo scene, gallery landed on `feat/phase-0-kit`.
 - 2026-04-24 · Chapter 1 complete. Autonomy-stack, frequency-pyramid, and module-coupling animations merged to main (abab3df, 7d5debf, 8d3ae82). Next: Ch2 hardware pair (exploded view + IMU vibration).
+- 2026-04-24 · Bright theme landed. Mode-aware `theme.js` with URL/localStorage resolution and `mountThemeToggle`; `Environment.js` gains a watermarked white floor + drifting logo-sprite clouds under `theme: 'light'`; `hud.css` carries `[data-theme="light"]` overrides and CSS var chrome. Ch1-1/2/3, `kit-demo.html`, and `index.html` retrofitted. Particle materials now fall back from `AdditiveBlending` to `NormalBlending` in light mode (additive vanishes on white). Not yet committed.

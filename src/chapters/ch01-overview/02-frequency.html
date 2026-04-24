@@ -9,17 +9,17 @@
   <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+SC:wght@300;400;500;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
   <link rel="stylesheet" href="/src/kit/hud.css">
   <style>
-    html, body { margin: 0; background: #07090d; overflow: hidden; }
+    html, body { margin: 0; background: var(--stage-bg); overflow: hidden; }
 
     /* Scaling-note footer inside the HUD panel. createPanel doesn't model
      * footers, so we append a free-form .hud-note row after construction. */
     .hud-note {
       margin-top: 8px;
       padding-top: 6px;
-      border-top: 0.5px dashed rgba(255, 255, 255, 0.12);
+      border-top: 0.5px dashed var(--hud-divider);
       font-family: "Noto Sans SC", sans-serif;
       font-size: 10px;
-      color: rgba(232, 236, 242, 0.58);
+      color: var(--hud-label);
       max-width: 250px;
       line-height: 1.45;
       letter-spacing: 0.02em;
@@ -36,7 +36,7 @@
     import { createPanel }       from '/src/kit/Hud.js';
     import { orbitCamera }       from '/src/kit/CameraRig.js';
     import { labels }            from '/src/kit/labels.js';
-    import { theme }             from '/src/kit/theme.js';
+    import { theme, hexToCss, mountThemeToggle } from '/src/kit/theme.js';
 
     // --- Rings model ------------------------------------------------------
     // Radii and tick counts go inside-out: control is innermost, densest,
@@ -80,9 +80,10 @@
 
     // --- Scene + renderer -------------------------------------------------
     const { scene, addLights, dispose: disposeEnv } = createEnvironment({
-      theme: 'dark', grid: true, fog: true, floor: true, sceneSize: 36,
+      grid: true, fog: true, floor: true, sceneSize: 36,
     });
     addLights();
+    mountThemeToggle();
 
     const stage = document.getElementById('stage');
     const camera = new THREE.PerspectiveCamera(
@@ -163,15 +164,11 @@
     stage.appendChild(panel.el);
 
     // Re-tint each row's value with the ring's own accent so the pyramid's
-    // four-color palette reads at a glance without extra legend text.
-    const accentCss = {
-      [theme.colors.control]:    '#ffb454',
-      [theme.colors.planning]:   '#5dd3ff',
-      [theme.colors.perception]: '#5dffb1',
-    };
+    // four-color palette reads at a glance without extra legend text. The
+    // ring `color` is a theme.colors.* int, so hexToCss handles both modes.
     const valueEls = panel.el.querySelectorAll('.hud-value');
     RINGS.forEach((r, i) => {
-      if (valueEls[i]) valueEls[i].style.color = accentCss[r.color];
+      if (valueEls[i]) valueEls[i].style.color = hexToCss(r.color);
     });
 
     const noteEl = document.createElement('div');

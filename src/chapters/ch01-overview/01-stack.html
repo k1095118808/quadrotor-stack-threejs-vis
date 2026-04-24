@@ -9,7 +9,7 @@
   <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+SC:wght@300;400;500;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
   <link rel="stylesheet" href="/src/kit/hud.css">
   <style>
-    html, body { margin: 0; background: #07090d; overflow: hidden; }
+    html, body { margin: 0; background: var(--stage-bg); overflow: hidden; }
 
     /* Per-plate Chinese labels overlay: DOM elements projected from 3D plate
      * centers each frame. Chinese copy lives in src/kit/labels.js. */
@@ -19,20 +19,20 @@
       font-family: "Noto Sans SC", sans-serif;
       font-size: 12px;
       font-weight: 400;
-      color: rgba(232, 236, 242, 0.62);
+      color: var(--label-fg);
       white-space: nowrap;
       pointer-events: none;
       padding: 2px 8px;
       border-radius: 3px;
-      background: rgba(7, 9, 13, 0.55);
-      border: 0.5px solid rgba(255, 255, 255, 0.08);
+      background: var(--label-bg);
+      border: 0.5px solid var(--label-border);
       letter-spacing: 0.04em;
       transition: color 180ms, border-color 180ms;
       will-change: transform;
     }
     .stack-label.active {
-      color: #5dffb1;
-      border-color: rgba(93, 255, 177, 0.45);
+      color: var(--c-perception);
+      border-color: color-mix(in srgb, var(--c-perception) 45%, transparent);
     }
 
     /* Flow-direction legend swatches inside the top-right HUD panel. */
@@ -44,8 +44,8 @@
       transform: translateY(1px);
       box-shadow: 0 0 6px currentColor;
     }
-    .flow-swatch.up   { color: #5dffb1; background: #5dffb1; }
-    .flow-swatch.down { color: #ffb454; background: #ffb454; }
+    .flow-swatch.up   { color: var(--c-perception); background: var(--c-perception); }
+    .flow-swatch.down { color: var(--c-control);    background: var(--c-control); }
   </style>
 </head>
 <body>
@@ -58,7 +58,7 @@
     import { createPanel }       from '/src/kit/Hud.js';
     import { orbitCamera }       from '/src/kit/CameraRig.js';
     import { labels }            from '/src/kit/labels.js';
-    import { theme }             from '/src/kit/theme.js';
+    import { theme, mountThemeToggle } from '/src/kit/theme.js';
 
     // --- Layer model ------------------------------------------------------
     // Bottom-up ordering matches the autonomy stack: hardware produces raw
@@ -80,9 +80,10 @@
 
     // --- Scene + renderer -------------------------------------------------
     const { scene, addLights, dispose: disposeEnv } = createEnvironment({
-      theme: 'dark', grid: true, fog: true, floor: true, sceneSize: 50,
+      grid: true, fog: true, floor: true, sceneSize: 50,
     });
     addLights();
+    mountThemeToggle();
 
     const stage = document.getElementById('stage');
     const camera = new THREE.PerspectiveCamera(
@@ -188,7 +189,9 @@
         map: particleSprite,
         transparent: true,
         depthWrite: false,
-        blending: THREE.AdditiveBlending,
+        // Additive blending glows nicely on dark bg but vanishes against
+        // white. Fall back to the default blend for the bright theme.
+        blending: theme.mode === 'light' ? THREE.NormalBlending : THREE.AdditiveBlending,
         sizeAttenuation: true,
       });
       const pts = new THREE.Points(geo, mat);

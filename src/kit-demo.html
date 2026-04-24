@@ -9,7 +9,7 @@
   <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+SC:wght@300;400;500;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
   <link rel="stylesheet" href="/src/kit/hud.css">
   <style>
-    html, body { margin: 0; background: #07090d; overflow: hidden; }
+    html, body { margin: 0; background: var(--stage-bg); overflow: hidden; }
   </style>
 </head>
 <body>
@@ -24,13 +24,14 @@
     import { followCamera }      from '/src/kit/CameraRig.js';
     import { createPanel, createChart } from '/src/kit/Hud.js';
     import { labels }            from '/src/kit/labels.js';
-    import { theme }             from '/src/kit/theme.js';
+    import { theme, mountThemeToggle } from '/src/kit/theme.js';
 
     // 1. scene ------------------------------------------------------------
     const { scene, addLights, dispose: disposeEnv } = createEnvironment({
-      theme: 'dark', grid: true, fog: true, floor: true, sceneSize: 60,
+      grid: true, fog: true, floor: true, sceneSize: 60,
     });
     addLights();
+    mountThemeToggle();
 
     // 2. camera + renderer ------------------------------------------------
     const stage = document.getElementById('stage');
