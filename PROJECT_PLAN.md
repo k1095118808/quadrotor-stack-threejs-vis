@@ -53,7 +53,7 @@ Produce a web-based presentation that introduces research newcomers to quadrotor
 - [x] Ch2 P0×2
 
 ### Phase 2 — Control and planning (Week 3)
-- [ ] Ch3 P0×2 + P1×1
+- [x] Ch3 P0×2 + P1×1
 - [ ] Ch5 P0×2 + P1×1
 
 ### Phase 3 — Estimation and perception (Week 4)
@@ -283,9 +283,9 @@ Only if schedule permits.
 | Ch1-3 耦合图 | 1 | ☑ | 8d3ae82 |
 | Ch2-1 模块分解视图 | 1 | ☑ | 1a93ff6 |
 | Ch2-2 IMU 振动 | 1 | ☑ | 54eded9 |
-| Ch3-1 欠驱动 | 2 | ☐ | |
-| Ch3-2 PID 阶跃 | 2 | ☐ | |
-| Ch3-3 SE(3) | 2 | ☐ | |
+| Ch3-1 欠驱动 | 2 | ☑ | c29d0d0 |
+| Ch3-2 PID 阶跃 | 2 | ☑ | e9aa304 |
+| Ch3-3 SE(3) | 2 | ☑ | d055ca6 |
 | Ch5-1 搜索扩展 | 2 | ☐ | |
 | Ch5-2 最小 Snap | 2 | ☐ | |
 | Ch5-3 安全走廊 | 2 | ☐ | |
@@ -365,3 +365,4 @@ export const labels = {
 - 2026-04-24 · Bright theme landed (d8320a9). Mode-aware `theme.js` with URL/localStorage resolution and `mountThemeToggle`; `Environment.js` gains a watermarked white floor + drifting logo-sprite clouds under `theme: 'light'`; `hud.css` carries `[data-theme="light"]` overrides and CSS var chrome. Ch1-1/2/3, `kit-demo.html`, and `index.html` retrofitted. Particle materials now fall back from `AdditiveBlending` to `NormalBlending` in light mode (additive vanishes on white).
 - 2026-04-24 · **Ch2-1 Exploded View** landed (`01-exploded.html`). Nine labeled part groups (frame, motor ×4, esc ×4, battery, fc, imu, cameras ×2, gnss, companion) built from primitives; radial/vertical explode offsets with per-part stagger; four-phase state machine (assemble → explode → hold → reform) with click-to-pause; DOM callouts carry zh bold + en monospace, projected via rounded-px translate3d per the label-jitter memory. Camera is a 50° FOV orbit at radius 5.2, lookAt y=0.3 — first pass at radius 3.6 cropped small parts (IMU especially) behind the GNSS puck, so the hold phase now pulls *out* (×1.15) instead of in.
 - 2026-04-24 · **Ch2-2 IMU Vibration** landed (`02-imu-vibration.html`). Split-screen layout (3D drone left, two oscilloscope canvases right, sliders below). Internal 600 Hz signal pipeline: raw `a(t) = g + A·sin(2π·f_rotor·t) + n(t)`, 1st-order IIR low-pass with `α = exp(-2π·fc/Fs)`, rendered on ±9 m/s² fixed axes so the raw spike dwarfs the filtered trace at high RPM. RPM + cutoff sliders, live SNR readout smoothed over 0.5 s. First draft coupled the raw sample straight into drone pose, but the 150 Hz vibration sampled at 60 fps aliased into jittery shimmer — replaced with a synthesized two-sine wobble (3.3 Hz + 6.1 Hz) scaled by RPM so the drone visibly "buzzes harder" without fighting the render rate. Phase 1 complete.
+- 2026-04-24 · **Chapter 3 complete** (`feat/ch03-control`). All three animations landed together on one branch. (a) **Ch3-1 欠驱动演示** (c29d0d0) — 13 s two-stage loop: Stage 1 ramps only T upward and the drone can't translate in +X (body-axial thrust); a strike marks infeasible. Stage 2 applies M_pitch first to tilt the body ~12°, then raises T so the rotated thrust gets a horizontal component, drone reaches the ghost goal, levels off. Four-cell input bar strip with reverse-direction cyan tint during the level-off; HUD titles carry the 6-vs-4 totals; log ring buffer stamps cycle-relative timestamps. (b) **Ch3-2 PID 阶跃响应** (e9aa304) — split orthographic altitude demo with right-panel DOM charts. Plant m·z̈ = T − m·g, T ∈ [0, 40 N], ∫ hard-clamped at ±20 for wind-up. 240 Hz sub-step, 60 Hz render, 10 s window with 2 s post-hold auto-restart. K_p/K_i/K_d sliders (color-coded thumbs matching sub-plots), three presets (仅 P / P+D / PID), live overshoot / settling / SS-error. (c) **Ch3-3 SE(3) 几何控制** (d055ca6) — proportional attitude controller on SO(3) with ω̇ = 2·K_R·vec(q_err) − K_ω·ω, unit inertia, K_R = 4, K_ω = 2 (ζ ≈ 0.5), 4× sub-step. Solid RGB body triad + faded RGB desired triad + magenta axis-angle error arrow; q_err canonicalised to w ≥ 0 so the arrow always shows the minimum-angle path. Resamples R_d uniformly on SO(3) every 6 s. Left/right panels show XYZ Euler decomposition so the audience can see the chart on the manifold is not canonical. Standard RGB axis colors — the one place the project breaks the four-color semantic palette, because viewers read body axes as RGB faster than as our accents.
