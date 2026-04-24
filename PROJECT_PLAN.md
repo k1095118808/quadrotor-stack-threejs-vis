@@ -281,8 +281,8 @@ Only if schedule permits.
 | Ch1-1 技术栈 | 1 | ☑ | abab3df |
 | Ch1-2 频率金字塔 | 1 | ☑ | 7d5debf |
 | Ch1-3 耦合图 | 1 | ☑ | 8d3ae82 |
-| Ch2-1 爆炸视图 | 1 | ☑ | _pending_ |
-| Ch2-2 IMU 振动 | 1 | ☑ | _pending_ |
+| Ch2-1 爆炸视图 | 1 | ☑ | 1a93ff6 |
+| Ch2-2 IMU 振动 | 1 | ☑ | 54eded9 |
 | Ch3-1 欠驱动 | 2 | ☐ | |
 | Ch3-2 PID 阶跃 | 2 | ☐ | |
 | Ch3-3 SE(3) | 2 | ☐ | |
