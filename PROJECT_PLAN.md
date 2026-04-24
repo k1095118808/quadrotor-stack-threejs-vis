@@ -79,7 +79,7 @@ Summary count: **28 animations planned** (12 P0, 10 P1, 6 P2).
 | 1 | 1 | 自主飞行技术栈 | Autonomy Stack | P0 |
 | 1 | 2 | 频率金字塔 | Frequency Pyramid | P0 |
 | 1 | 3 | 模块耦合图 | Module Coupling Graph | P1 |
-| 2 | 1 | 四旋翼爆炸视图 | Quadrotor Exploded View | P0 |
+| 2 | 1 | 四旋翼模块分解视图 | Quadrotor Exploded View | P0 |
 | 2 | 2 | IMU 振动耦合 | IMU Vibration Coupling | P0 |
 | 2 | 3 | 电机推力曲线 | Thrust–RPM Curve | P1 |
 | 2 | 4 | 信号链 | Signal Chain | P1 |
@@ -131,7 +131,7 @@ Each spec follows the same template: **goal** (what the viewer walks away unders
 - **Duration.** 20s loop.
 - **Notes.** Real ratios are too extreme to render at true scale. Use log scaling but label it. The honesty here matters.
 
-### P0-3 · 四旋翼爆炸视图 (Ch2, flagship for hardware)
+### P0-3 · 四旋翼模块分解视图 (Ch2, flagship for hardware)
 
 - **Goal.** The viewer sees and remembers the components that compose a quadrotor.
 - **Scene.** A detailed quadrotor centered in frame. Start: fully assembled. Components tracked individually: 机架, ×4 电机, ×4 电调, 电池, 飞控, IMU, ×2 相机, GNSS 天线, 机载计算机.
@@ -281,7 +281,7 @@ Only if schedule permits.
 | Ch1-1 技术栈 | 1 | ☑ | abab3df |
 | Ch1-2 频率金字塔 | 1 | ☑ | 7d5debf |
 | Ch1-3 耦合图 | 1 | ☑ | 8d3ae82 |
-| Ch2-1 爆炸视图 | 1 | ☑ | 1a93ff6 |
+| Ch2-1 模块分解视图 | 1 | ☑ | 1a93ff6 |
 | Ch2-2 IMU 振动 | 1 | ☑ | 54eded9 |
 | Ch3-1 欠驱动 | 2 | ☐ | |
 | Ch3-2 PID 阶跃 | 2 | ☐ | |
