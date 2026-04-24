@@ -1,0 +1,504 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Ch3 · PID 阶跃响应</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+SC:wght@300;400;500;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/src/kit/hud.css">
+  <style>
+    /* PID altitude-step demo.
+     *   Plant: m·z̈ = T − m·g, m = 1 kg, g = 9.81. Controller is gravity-
+     *   compensating (T = m·g + PID(e)); output is clamped at zero (thrust
+     *   can't push down) and saturated at 40 N to model real actuator limits.
+     *   Integrator uses back-calculation anti-windup while saturated.
+     *   Any slider move restarts the sim from z = 0, ż = 0, ∫e = 0. */
+
+    html, body { margin: 0; background: var(--stage-bg); color: var(--label-strong-fg);
+                 font-family: "Noto Sans SC", sans-serif; overflow: hidden; }
+    body { display: flex; width: 100vw; height: 100vh; }
+
+    #stage { flex: 1 1 55%; position: relative; min-width: 0; }
+    #panel {
+      flex: 0 0 480px;
+      display: flex; flex-direction: column;
+      gap: 10px;
+      padding: 18px 20px 20px;
+      background: var(--hud-bg);
+      border-left: 0.5px solid var(--hud-border);
+      overflow: auto;
+    }
+    @media (max-width: 980px) { #panel { flex-basis: 380px; } }
+
+    .panel-title { font-size: 13px; font-weight: 500; letter-spacing: 0.04em; margin: 0 0 1px; }
+    .panel-sub   { font-family: "JetBrains Mono", monospace; font-size: 10px;
+                   color: var(--hud-unit); letter-spacing: 0.02em; }
+
+    .chart-wrap {
+      border: 0.5px solid var(--hud-border);
+      border-radius: 6px;
+      padding: 6px 10px 4px;
+      background: color-mix(in srgb, var(--stage-bg) 72%, transparent);
+    }
+    .chart-head { display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 2px; }
+    .chart-head .lbl   { font-size: 11px; font-weight: 500; }
+    .chart-head .units { font-family: "JetBrains Mono", monospace; font-size: 10px; color: var(--hud-unit); }
+    .chart-wrap canvas { display: block; width: 100%; }
+    #altChart   { height: 130px; }
+    .subchart   { height: 62px; }
+
+    .subrow { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 6px; }
+
+    #controls { display: flex; flex-direction: column; gap: 8px; padding-top: 2px; }
+    .row { display: flex; flex-direction: column; gap: 3px; }
+    .row-head { display: flex; justify-content: space-between; align-items: baseline; }
+    .row-head .lab { font-size: 11px; color: var(--hud-label); font-family: "JetBrains Mono", monospace; }
+    .row-head .val { font-family: "JetBrains Mono", monospace; font-size: 11px;
+                     color: var(--label-strong-fg); font-variant-numeric: tabular-nums; }
+    input[type=range] {
+      -webkit-appearance: none; appearance: none;
+      width: 100%; height: 3px; margin: 2px 0;
+      background: var(--hud-divider); border-radius: 2px; outline: none; cursor: pointer;
+    }
+    input[type=range]::-webkit-slider-thumb,
+    input[type=range]::-moz-range-thumb {
+      -webkit-appearance: none; appearance: none;
+      width: 14px; height: 14px; border-radius: 50%;
+      background: var(--c-planning); border: 0.5px solid var(--hud-border);
+    }
+    /* Kd slider uses the amber accent so the color pairs with its sub-chart. */
+    #kdRow input[type=range]::-webkit-slider-thumb,
+    #kdRow input[type=range]::-moz-range-thumb { background: var(--c-control); }
+    #kiRow input[type=range]::-webkit-slider-thumb,
+    #kiRow input[type=range]::-moz-range-thumb { background: var(--c-planning); }
+    #kpRow input[type=range]::-webkit-slider-thumb,
+    #kpRow input[type=range]::-moz-range-thumb { background: var(--c-perception); }
+
+    .presets { display: flex; gap: 6px; padding-top: 4px; }
+    .presets button {
+      flex: 1;
+      font-family: "Noto Sans SC", sans-serif;
+      font-size: 11px;
+      color: var(--label-fg);
+      background: transparent;
+      border: 0.5px solid var(--hud-border);
+      border-radius: 3px;
+      padding: 5px 0;
+      cursor: pointer;
+      transition: border-color 120ms, color 120ms;
+    }
+    .presets button:hover { border-color: var(--c-planning); color: var(--label-strong-fg); }
+    .presets button.active { border-color: var(--c-planning); color: var(--c-planning); }
+
+    #readouts {
+      display: grid; grid-template-columns: 1fr auto; gap: 3px 18px;
+      padding-top: 8px; border-top: 0.5px solid var(--hud-divider);
+    }
+    #readouts .k { font-size: 11px; color: var(--hud-label); }
+    #readouts .v { font-family: "JetBrains Mono", monospace; font-size: 11px;
+                   color: var(--label-strong-fg); font-variant-numeric: tabular-nums;
+                   text-align: right; }
+
+    .note { font-family: "JetBrains Mono", monospace; font-size: 9.5px;
+            color: var(--hud-unit); letter-spacing: 0.02em; line-height: 1.4; }
+  </style>
+</head>
+<body>
+  <div id="stage"></div>
+  <aside id="panel">
+    <div>
+      <div class="panel-title" id="title"></div>
+      <div class="panel-sub">PID Step Response</div>
+    </div>
+
+    <div class="chart-wrap">
+      <div class="chart-head">
+        <span class="lbl" id="altLbl"></span>
+        <span class="units" id="altUnits">z / m · 0–8</span>
+      </div>
+      <canvas id="altChart"></canvas>
+    </div>
+
+    <div class="subrow">
+      <div class="chart-wrap"><div class="chart-head"><span class="lbl" id="pLbl" style="color:var(--c-perception)"></span></div><canvas id="pChart" class="subchart"></canvas></div>
+      <div class="chart-wrap"><div class="chart-head"><span class="lbl" id="iLbl" style="color:var(--c-planning)"></span></div><canvas id="iChart" class="subchart"></canvas></div>
+      <div class="chart-wrap"><div class="chart-head"><span class="lbl" id="dLbl" style="color:var(--c-control)"></span></div><canvas id="dChart" class="subchart"></canvas></div>
+    </div>
+
+    <div id="controls">
+      <div class="row" id="kpRow">
+        <div class="row-head"><span class="lab" id="kpLbl">K_p</span><span class="val"><span id="kpVal">4.00</span></span></div>
+        <input id="kp" type="range" min="0" max="20" step="0.05" value="4">
+      </div>
+      <div class="row" id="kiRow">
+        <div class="row-head"><span class="lab" id="kiLbl">K_i</span><span class="val"><span id="kiVal">0.50</span></span></div>
+        <input id="ki" type="range" min="0" max="5" step="0.02" value="0.5">
+      </div>
+      <div class="row" id="kdRow">
+        <div class="row-head"><span class="lab" id="kdLbl">K_d</span><span class="val"><span id="kdVal">2.00</span></span></div>
+        <input id="kd" type="range" min="0" max="10" step="0.05" value="2">
+      </div>
+    </div>
+
+    <div class="presets">
+      <button id="presetP"></button>
+      <button id="presetPD"></button>
+      <button id="presetPID"></button>
+    </div>
+
+    <div id="readouts">
+      <span class="k" id="overLbl"></span>    <span class="v" id="overVal">—</span>
+      <span class="k" id="settleLbl"></span>  <span class="v" id="settleVal">—</span>
+      <span class="k" id="errLbl"></span>     <span class="v" id="errVal">—</span>
+    </div>
+    <div class="note" id="plantNote"></div>
+    <div class="note" id="resetHint" style="opacity:0.75"></div>
+  </aside>
+
+  <script type="module">
+    import * as THREE from 'three';
+    import { createEnvironment } from '/src/kit/Environment.js';
+    import { createDrone }       from '/src/kit/Quadrotor.js';
+    import { labels }            from '/src/kit/labels.js';
+    import { theme, mountThemeToggle, hexToCss } from '/src/kit/theme.js';
+
+    const L = labels.ch03.pid;
+    document.getElementById('title').textContent     = labels.ch03.pidTitle;
+    document.getElementById('altLbl').textContent    = L.altitudeChart;
+    document.getElementById('pLbl').textContent      = L.contribP;
+    document.getElementById('iLbl').textContent      = L.contribI;
+    document.getElementById('dLbl').textContent      = L.contribD;
+    document.getElementById('kpLbl').textContent     = L.kpLabel;
+    document.getElementById('kiLbl').textContent     = L.kiLabel;
+    document.getElementById('kdLbl').textContent     = L.kdLabel;
+    document.getElementById('presetP').textContent   = L.presetP;
+    document.getElementById('presetPD').textContent  = L.presetPD;
+    document.getElementById('presetPID').textContent = L.presetPID;
+    document.getElementById('overLbl').textContent   = L.overshootLabel;
+    document.getElementById('settleLbl').textContent = L.settleLabel;
+    document.getElementById('errLbl').textContent    = L.ssErrorLabel;
+    document.getElementById('plantNote').textContent = L.plantNote;
+    document.getElementById('resetHint').textContent = L.resetHint;
+
+    // --- 3D side-view ----------------------------------------------------
+    const stage = document.getElementById('stage');
+    const { scene, addLights, dispose: disposeEnv } = createEnvironment({
+      grid: true, fog: false, floor: true, sceneSize: 20,
+    });
+    addLights();
+    mountThemeToggle();
+
+    // Orthographic so altitude reads in world units, not perspective
+    // foreshortening. Frustum is symmetric about a center at y = CENTER_Y,
+    // so the visible world Y range is [CENTER_Y − VIEW_H/2, CENTER_Y + VIEW_H/2].
+    const aspect0 = stage.clientWidth / stage.clientHeight;
+    const VIEW_H = 9;
+    const CENTER_Y = 4;
+    const cam = new THREE.OrthographicCamera(
+      -VIEW_H * aspect0 / 2, VIEW_H * aspect0 / 2,
+       VIEW_H / 2,           -VIEW_H / 2,
+       0.1, 60,
+    );
+    cam.position.set(0, CENTER_Y, 10);
+    cam.lookAt(0, CENTER_Y, 0);
+
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+    renderer.setSize(stage.clientWidth, stage.clientHeight);
+    stage.appendChild(renderer.domElement);
+
+    const drone = createDrone({ scale: 1.2, accentColor: theme.colors.executed, showThrustVector: true });
+    scene.add(drone.group);
+    drone.group.position.set(0, 0.2, 0);
+
+    // Target line at z_ref = 5: a dashed horizontal line. Built as a
+    // LineSegments with alternating on/off spans.
+    const Z_REF = 5.0;
+    const targetMat = new THREE.LineBasicMaterial({ color: theme.colors.executed, transparent: true, opacity: 0.7 });
+    const segPts = [];
+    const X_SPAN = 8;
+    for (let x = -X_SPAN; x < X_SPAN; x += 0.4) {
+      segPts.push(new THREE.Vector3(x, Z_REF, 0));
+      segPts.push(new THREE.Vector3(x + 0.22, Z_REF, 0));
+    }
+    const targetGeo = new THREE.BufferGeometry().setFromPoints(segPts);
+    const targetLine = new THREE.LineSegments(targetGeo, targetMat);
+    scene.add(targetLine);
+
+    // Altitude-scale tick marks on the left (y = 0..8 every 1 m).
+    const tickMat = new THREE.LineBasicMaterial({ color: theme.colors.grid, transparent: true, opacity: 0.4 });
+    const tickPts = [];
+    for (let h = 0; h <= 8; h++) {
+      tickPts.push(new THREE.Vector3(-X_SPAN, h, 0));
+      tickPts.push(new THREE.Vector3(-X_SPAN + 0.25, h, 0));
+    }
+    const tickGeo = new THREE.BufferGeometry().setFromPoints(tickPts);
+    const tickLine = new THREE.LineSegments(tickGeo, tickMat);
+    scene.add(tickLine);
+
+    // --- PID sim ---------------------------------------------------------
+    const M = 1, G = 9.81;
+    const T_MAX = 40;           // actuator saturation (N) — plant clamps here
+    const SIM_DUR = 10.0;       // seconds
+    const DT_SIM  = 1 / 240;    // seconds — sub-step for stable Euler integration
+
+    const kpEl = document.getElementById('kp');
+    const kiEl = document.getElementById('ki');
+    const kdEl = document.getElementById('kd');
+    const kpVal = document.getElementById('kpVal');
+    const kiVal = document.getElementById('kiVal');
+    const kdVal = document.getElementById('kdVal');
+
+    let Kp = +kpEl.value, Ki = +kiEl.value, Kd = +kdEl.value;
+
+    // Sim history — one array per series, 60 Hz downsample for drawing.
+    const FRAMES = Math.round(SIM_DUR * 60);
+    const histZ = new Float32Array(FRAMES);
+    const histP = new Float32Array(FRAMES);
+    const histI = new Float32Array(FRAMES);
+    const histD = new Float32Array(FRAMES);
+    let frameIdx = 0;
+
+    // Live state.
+    let z, zdot, integ, ePrev;
+    // Stats.
+    let maxZ, settleT, hasSettled;
+
+    function resetSim() {
+      z = 0; zdot = 0; integ = 0; ePrev = Z_REF;
+      frameIdx = 0;
+      maxZ = 0; settleT = NaN; hasSettled = false;
+      histZ.fill(0); histP.fill(0); histI.fill(0); histD.fill(0);
+      overVal.textContent = '—';
+      settleValEl.textContent = '—';
+      errValEl.textContent = '—';
+    }
+
+    const overVal      = document.getElementById('overVal');
+    const settleValEl  = document.getElementById('settleVal');
+    const errValEl     = document.getElementById('errVal');
+
+    // Controller step. Integrator is hard-clamped to ±I_LIMIT to prevent
+    // wind-up during saturation. Cleaner than back-calc for a teaching demo,
+    // and the viewer can see the clamp's effect by cranking Ki alone.
+    const I_LIMIT = 20;
+    function pidStep(dt, e) {
+      const P = Kp * e;
+      integ += Ki * e * dt;
+      if (integ >  I_LIMIT) integ =  I_LIMIT;
+      if (integ < -I_LIMIT) integ = -I_LIMIT;
+      const I = integ;
+      const D = Kd * ((e - ePrev) / dt); // derivative on error; ref constant ⇒ == −Kd·ż
+      ePrev = e;
+      const u = P + I + D;               // output in acceleration units (force / mass)
+      const Tcmd = M * G + u;
+      const Tsat = Math.max(0, Math.min(T_MAX, Tcmd));
+      const uApp = Tsat - M * G;
+      return { u: uApp, P, I, D };
+    }
+
+    function advanceFrame() {
+      const subSteps = Math.round((1 / 60) / DT_SIM);
+      let lastP = 0, lastI = 0, lastD = 0;
+      for (let s = 0; s < subSteps; s++) {
+        const e = Z_REF - z;
+        const { u, P, I, D } = pidStep(DT_SIM, e);
+        const zddot = u; // m = 1
+        zdot += zddot * DT_SIM;
+        z    += zdot  * DT_SIM;
+        if (z < 0) { z = 0; if (zdot < 0) zdot = 0; } // ground floor
+        lastP = P; lastI = I; lastD = D;
+      }
+      if (frameIdx < FRAMES) {
+        histZ[frameIdx] = z;
+        histP[frameIdx] = lastP;
+        histI[frameIdx] = lastI;
+        histD[frameIdx] = lastD;
+        frameIdx++;
+      }
+
+      // Stat tracking.
+      if (z > maxZ) maxZ = z;
+      if (!hasSettled) {
+        const within = Math.abs(z - Z_REF) < 0.02 * Z_REF;
+        if (within && Math.abs(zdot) < 0.08) {
+          // Need the drone to stay within band for ≥ 0.5 s to declare settled.
+          if (!settleCand.active) { settleCand.active = true; settleCand.start = frameIdx; }
+          else if ((frameIdx - settleCand.start) / 60 > 0.5) {
+            settleT = settleCand.start / 60;
+            hasSettled = true;
+          }
+        } else {
+          settleCand.active = false;
+        }
+      }
+    }
+    const settleCand = { active: false, start: 0 };
+
+    function updateStats() {
+      const over = Math.max(0, maxZ - Z_REF) / Z_REF * 100;
+      overVal.textContent = over.toFixed(1) + ' %';
+      settleValEl.textContent = Number.isFinite(settleT) ? settleT.toFixed(2) + ' s' : '—';
+      const ss = Math.abs(z - Z_REF);
+      errValEl.textContent = ss.toFixed(3) + ' m';
+    }
+
+    // --- Chart drawing ---------------------------------------------------
+    function setupCanvas(id) {
+      const c = document.getElementById(id);
+      const dpr = Math.min(window.devicePixelRatio || 1, 2);
+      const rect = c.getBoundingClientRect();
+      c.width  = Math.max(1, Math.round(rect.width  * dpr));
+      c.height = Math.max(1, Math.round(rect.height * dpr));
+      const ctx = c.getContext('2d');
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      return { ctx, w: rect.width, h: rect.height, canvas: c };
+    }
+    let altCtx, pCtx, iCtx, dCtx;
+    function resizeCharts() {
+      altCtx = setupCanvas('altChart');
+      pCtx   = setupCanvas('pChart');
+      iCtx   = setupCanvas('iChart');
+      dCtx   = setupCanvas('dChart');
+    }
+    resizeCharts();
+
+    const PID_RANGE = 24; // ± for sub-chart vertical extent
+
+    function drawSeries(dim, buf, color, yRange, drawRef) {
+      const { ctx, w, h } = dim;
+      ctx.clearRect(0, 0, w, h);
+      const divider = getComputedStyle(dim.canvas).getPropertyValue('--hud-divider').trim() || 'rgba(255,255,255,0.08)';
+      const [lo, hi] = yRange;
+      const span = hi - lo;
+
+      // Zero / ref line.
+      ctx.strokeStyle = divider;
+      ctx.lineWidth = 0.5;
+      ctx.setLineDash([2, 3]);
+      if (drawRef) {
+        const yR = h - ((drawRef - lo) / span) * h;
+        ctx.beginPath(); ctx.moveTo(0, yR); ctx.lineTo(w, yR); ctx.stroke();
+      } else {
+        const y0 = h - ((0 - lo) / span) * h;
+        ctx.beginPath(); ctx.moveTo(0, y0); ctx.lineTo(w, y0); ctx.stroke();
+      }
+      ctx.setLineDash([]);
+
+      // Trace up to frameIdx.
+      if (frameIdx < 2) return;
+      ctx.strokeStyle = color;
+      ctx.lineWidth = 1.1;
+      ctx.beginPath();
+      for (let i = 0; i < frameIdx; i++) {
+        const x = (i / (FRAMES - 1)) * w;
+        const yNorm = (buf[i] - lo) / span;
+        const y = h - Math.max(0, Math.min(1, yNorm)) * h;
+        if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+      }
+      ctx.stroke();
+
+      // Progress ghost: vertical cursor at the current frame tip.
+      const xTip = (frameIdx / (FRAMES - 1)) * w;
+      ctx.strokeStyle = divider;
+      ctx.lineWidth = 0.5;
+      ctx.setLineDash([2, 2]);
+      ctx.beginPath(); ctx.moveTo(xTip, 0); ctx.lineTo(xTip, h); ctx.stroke();
+      ctx.setLineDash([]);
+    }
+
+    const altColor = hexToCss(theme.colors.planning);
+    const pColor   = hexToCss(theme.colors.perception);
+    const iColor   = hexToCss(theme.colors.planning);
+    const dColor   = hexToCss(theme.colors.control);
+
+    function drawAllCharts() {
+      drawSeries(altCtx, histZ, altColor, [0, 8], Z_REF);
+      drawSeries(pCtx,   histP, pColor,   [-PID_RANGE, PID_RANGE]);
+      drawSeries(iCtx,   histI, iColor,   [-PID_RANGE, PID_RANGE]);
+      drawSeries(dCtx,   histD, dColor,   [-PID_RANGE, PID_RANGE]);
+    }
+
+    // --- Slider + preset wiring ------------------------------------------
+    function setPreset(kp, ki, kd, which) {
+      kpEl.value = kp; kiEl.value = ki; kdEl.value = kd;
+      kpVal.textContent = kp.toFixed(2);
+      kiVal.textContent = ki.toFixed(2);
+      kdVal.textContent = kd.toFixed(2);
+      Kp = kp; Ki = ki; Kd = kd;
+      for (const b of [btnP, btnPD, btnPID]) b.classList.remove('active');
+      which?.classList.add('active');
+      resetSim();
+    }
+    const btnP   = document.getElementById('presetP');
+    const btnPD  = document.getElementById('presetPD');
+    const btnPID = document.getElementById('presetPID');
+    btnP.addEventListener('click',   () => setPreset(4,   0,   0,   btnP));
+    btnPD.addEventListener('click',  () => setPreset(4,   0,   2,   btnPD));
+    btnPID.addEventListener('click', () => setPreset(4,   1.2, 2,   btnPID));
+
+    function onSliderInput() {
+      Kp = +kpEl.value; Ki = +kiEl.value; Kd = +kdEl.value;
+      kpVal.textContent = Kp.toFixed(2);
+      kiVal.textContent = Ki.toFixed(2);
+      kdVal.textContent = Kd.toFixed(2);
+      for (const b of [btnP, btnPD, btnPID]) b.classList.remove('active');
+      resetSim();
+    }
+    kpEl.addEventListener('input', onSliderInput);
+    kiEl.addEventListener('input', onSliderInput);
+    kdEl.addEventListener('input', onSliderInput);
+
+    resetSim();
+    setPreset(4, 1.2, 2, btnPID);
+
+    // --- Main loop -------------------------------------------------------
+    const clock = new THREE.Clock();
+    let accumSim = 0;
+
+    (function tick() {
+      const dt = Math.min(0.05, clock.getDelta());
+
+      // Advance sim at 60 Hz frame cadence while there's room.
+      accumSim += dt;
+      while (accumSim >= 1 / 60 && frameIdx < FRAMES) {
+        advanceFrame();
+        accumSim -= 1 / 60;
+      }
+
+      // After the sim window ends, auto-restart after a brief hold so the
+      // viewer can read the final trace before it wipes. accumSim keeps
+      // climbing with dt from the top of tick() — no second increment here.
+      if (frameIdx >= FRAMES && accumSim > 2.0) { resetSim(); accumSim = 0; }
+
+      drone.group.position.y = z + 0.2;
+      drone.update(dt);
+
+      drawAllCharts();
+      updateStats();
+
+      renderer.render(scene, cam);
+      requestAnimationFrame(tick);
+    })();
+
+    // --- Resize + dispose ------------------------------------------------
+    addEventListener('resize', () => {
+      const w = stage.clientWidth, h = stage.clientHeight;
+      const aspect = w / h;
+      cam.left  = -VIEW_H * aspect / 2; cam.right  = VIEW_H * aspect / 2;
+      cam.top   =  VIEW_H / 2;          cam.bottom = -VIEW_H / 2;
+      cam.updateProjectionMatrix();
+      renderer.setSize(w, h);
+      resizeCharts();
+    });
+    addEventListener('beforeunload', () => {
+      drone.dispose();
+      targetGeo.dispose(); targetMat.dispose();
+      tickGeo.dispose(); tickMat.dispose();
+      disposeEnv(); renderer.dispose();
+    });
+  </script>
+</body>
+</html>
