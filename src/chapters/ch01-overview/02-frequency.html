@@ -1,0 +1,233 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Ch1 · 频率金字塔</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+SC:wght@300;400;500;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/src/kit/hud.css">
+  <style>
+    html, body { margin: 0; background: #07090d; overflow: hidden; }
+
+    /* Scaling-note footer inside the HUD panel. createPanel doesn't model
+     * footers, so we append a free-form .hud-note row after construction. */
+    .hud-note {
+      margin-top: 8px;
+      padding-top: 6px;
+      border-top: 0.5px dashed rgba(255, 255, 255, 0.12);
+      font-family: "Noto Sans SC", sans-serif;
+      font-size: 10px;
+      color: rgba(232, 236, 242, 0.58);
+      max-width: 250px;
+      line-height: 1.45;
+      letter-spacing: 0.02em;
+    }
+  </style>
+</head>
+<body>
+  <div id="stage" style="position:relative;width:100vw;height:100vh"></div>
+
+  <script type="module">
+    import * as THREE from 'three';
+    import { createEnvironment } from '/src/kit/Environment.js';
+    import { createDrone }       from '/src/kit/Quadrotor.js';
+    import { createPanel }       from '/src/kit/Hud.js';
+    import { orbitCamera }       from '/src/kit/CameraRig.js';
+    import { labels }            from '/src/kit/labels.js';
+    import { theme }             from '/src/kit/theme.js';
+
+    // --- Rings model ------------------------------------------------------
+    // Radii and tick counts go inside-out: control is innermost, densest,
+    // and spins fastest. Rotation speeds (deg/s) are proportional to the
+    // true frequency ratios — ~30 : 50 : 1000 normalized by 30 Hz →
+    // 1 : 1.67 : 33.3. The HUD footer calls this out so the visual blur is
+    // read as "literally the real ratio" rather than artistic license.
+    const RINGS = [
+      {
+        key: 'control',
+        label: labels.ch01.pyramid.ringControl,
+        freqText: '1 kHz',
+        radius: 1.9,
+        tickCount: 240,
+        color: theme.colors.control,
+        tickLen: 0.16,
+        speedDeg: 600, // 1.67 rev/s — intentionally blurs
+      },
+      {
+        key: 'planning',
+        label: labels.ch01.pyramid.ringPlanning,
+        freqText: '50 Hz',
+        radius: 2.9,
+        tickCount: 100,
+        color: theme.colors.planning,
+        tickLen: 0.22,
+        speedDeg: 30,
+      },
+      {
+        key: 'perception',
+        label: labels.ch01.pyramid.ringPerception,
+        freqText: '30 Hz',
+        radius: 4.0,
+        tickCount: 30,
+        color: theme.colors.perception,
+        tickLen: 0.32,
+        speedDeg: 18,
+      },
+    ];
+    const RING_Y = 0.18;
+
+    // --- Scene + renderer -------------------------------------------------
+    const { scene, addLights, dispose: disposeEnv } = createEnvironment({
+      theme: 'dark', grid: true, fog: true, floor: true, sceneSize: 36,
+    });
+    addLights();
+
+    const stage = document.getElementById('stage');
+    const camera = new THREE.PerspectiveCamera(
+      48, stage.clientWidth / stage.clientHeight, 0.1, 200,
+    );
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setSize(stage.clientWidth, stage.clientHeight);
+    renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+    stage.appendChild(renderer.domElement);
+
+    // --- Build rings ------------------------------------------------------
+    // Each ring is an InstancedMesh of tick boxes arranged around a circle
+    // plus a faint torus guide so the circle reads even at rest. Ticks live
+    // in a rotating container; the torus does not rotate.
+    const ringResources = []; // for dispose()
+    const rotatingRings = []; // per-ring rotating group + speed
+
+    for (const r of RINGS) {
+      const tickGeo = new THREE.BoxGeometry(r.tickLen, 0.05, 0.04);
+      const tickMat = new THREE.MeshBasicMaterial({
+        color: r.color, transparent: true, opacity: 0.92,
+      });
+      const ticks = new THREE.InstancedMesh(tickGeo, tickMat, r.tickCount);
+      ticks.instanceMatrix.setUsage(THREE.StaticDrawUsage);
+
+      const m = new THREE.Matrix4();
+      const v = new THREE.Vector3();
+      const q = new THREE.Quaternion();
+      const s = new THREE.Vector3(1, 1, 1);
+      const axisY = new THREE.Vector3(0, 1, 0);
+      for (let i = 0; i < r.tickCount; i++) {
+        const angle = (i / r.tickCount) * Math.PI * 2;
+        v.set(Math.cos(angle) * r.radius, RING_Y, Math.sin(angle) * r.radius);
+        q.setFromAxisAngle(axisY, -angle);
+        m.compose(v, q, s);
+        ticks.setMatrixAt(i, m);
+      }
+      ticks.instanceMatrix.needsUpdate = true;
+
+      const rotGroup = new THREE.Group();
+      rotGroup.add(ticks);
+      scene.add(rotGroup);
+
+      const torusGeo = new THREE.TorusGeometry(r.radius, 0.012, 6, 96);
+      const torusMat = new THREE.MeshBasicMaterial({
+        color: r.color, transparent: true, opacity: 0.22,
+      });
+      const torus = new THREE.Mesh(torusGeo, torusMat);
+      torus.rotation.x = -Math.PI / 2;
+      torus.position.y = RING_Y;
+      scene.add(torus);
+
+      ringResources.push({ tickGeo, tickMat, torusGeo, torusMat, torus });
+      rotatingRings.push({
+        group: rotGroup,
+        speedRad: THREE.MathUtils.degToRad(r.speedDeg),
+      });
+    }
+
+    // --- Drone at center --------------------------------------------------
+    const drone = createDrone({
+      scale: 0.55,
+      accentColor: theme.colors.executed,
+      showThrustVector: false,
+    });
+    drone.group.position.y = 0.45;
+    scene.add(drone.group);
+
+    // --- HUD: one panel, one row per ring, plus scaling-note footer ------
+    const panel = createPanel({
+      title: labels.ch01.pyramid.panelTitle,
+      corner: 'tl',
+      color: 'cyan',
+      items: RINGS.map(r => ({
+        key: r.key, label: r.label, value: r.freqText,
+      })),
+    });
+    stage.appendChild(panel.el);
+
+    // Re-tint each row's value with the ring's own accent so the pyramid's
+    // four-color palette reads at a glance without extra legend text.
+    const accentCss = {
+      [theme.colors.control]:    '#ffb454',
+      [theme.colors.planning]:   '#5dd3ff',
+      [theme.colors.perception]: '#5dffb1',
+    };
+    const valueEls = panel.el.querySelectorAll('.hud-value');
+    RINGS.forEach((r, i) => {
+      if (valueEls[i]) valueEls[i].style.color = accentCss[r.color];
+    });
+
+    const noteEl = document.createElement('div');
+    noteEl.className = 'hud-note';
+    noteEl.textContent = labels.ch01.pyramid.note;
+    panel.el.appendChild(noteEl);
+
+    // --- Main loop --------------------------------------------------------
+    const clock = new THREE.Clock();
+    const orbitTarget = new THREE.Vector3(0, 0.2, 0);
+
+    (function tick() {
+      const dt = Math.min(0.05, clock.getDelta());
+
+      // Spin each ring at its assigned rate.
+      for (const r of rotatingRings) {
+        r.group.rotation.y += r.speedRad * dt;
+      }
+
+      // Drone: gentle bob + slow yaw for life.
+      const tNow = performance.now() * 0.001;
+      drone.group.position.y = 0.45 + Math.sin(tNow * 1.2) * 0.05;
+      drone.group.rotation.y = tNow * 0.15;
+      drone.update(dt);
+
+      // Camera: near-top-down with a slight tilt; very slow orbit (40s/rev).
+      orbitCamera(camera, {
+        target: orbitTarget,
+        radius: 2.0,
+        height: 7.0,
+        speed: (2 * Math.PI) / 40,
+      });
+
+      renderer.render(scene, camera);
+      requestAnimationFrame(tick);
+    })();
+
+    // --- Resize + dispose -------------------------------------------------
+    addEventListener('resize', () => {
+      camera.aspect = stage.clientWidth / stage.clientHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(stage.clientWidth, stage.clientHeight);
+    });
+
+    addEventListener('beforeunload', () => {
+      drone.dispose();
+      for (const r of ringResources) {
+        r.tickGeo.dispose();
+        r.tickMat.dispose();
+        r.torusGeo.dispose();
+        r.torusMat.dispose();
+      }
+      panel.dispose();
+      disposeEnv();
+      renderer.dispose();
+    });
+  </script>
+</body>
+</html>

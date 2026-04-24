@@ -42,6 +42,16 @@ export const labels = {
       freqPerception:   '10 – 60 Hz',
       freqCoordination: '1 – 10 Hz',
     },
+    pyramid: {
+      panelTitle: '频率金字塔',
+      ringControl:    '控制环 · 内',
+      ringPlanning:   '规划环 · 中',
+      ringPerception: '感知环 · 外',
+      // Footer note: visual rotation speeds are proportional to the true
+      // frequency ratio (control ≈ 33× perception). Without a note the
+      // viewer might assume the pyramid's visual blur is artistic.
+      note: '转速反映真实频率比 · 控制环约 33× 感知环',
+    },
   },
   ch02: {
     explodedTitle:     '四旋翼组件',
