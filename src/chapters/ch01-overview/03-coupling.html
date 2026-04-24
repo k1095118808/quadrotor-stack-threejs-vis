@@ -1,0 +1,386 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Ch1 · 模块耦合</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+SC:wght@300;400;500;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/src/kit/hud.css">
+  <style>
+    html, body { margin: 0; background: #07090d; overflow: hidden; }
+
+    /* Node labels: projected DOM overlays above each sphere. Integer pixel
+     * coords + translate3d keep the glyphs on their own layer so they
+     * don't shimmer during the orbit (see the Ch1-1 fix). */
+    .node-label {
+      position: absolute;
+      top: 0; left: 0;
+      font-family: "Noto Sans SC", sans-serif;
+      font-size: 13px;
+      font-weight: 500;
+      color: rgba(232, 236, 242, 0.78);
+      white-space: nowrap;
+      pointer-events: none;
+      padding: 2px 10px;
+      border-radius: 3px;
+      background: rgba(7, 9, 13, 0.60);
+      border: 0.5px solid rgba(255, 255, 255, 0.10);
+      letter-spacing: 0.04em;
+      transition: color 180ms, border-color 180ms, opacity 180ms;
+      will-change: transform;
+    }
+    .node-label.active  { color: var(--node-accent, #e8ecf2); border-color: var(--node-accent, #5dd3ff); }
+    .node-label.dim     { opacity: 0.35; }
+
+    /* Bottom-center idle hint — disappears once a node is selected. */
+    .hint {
+      position: absolute;
+      left: 50%; bottom: 24px;
+      transform: translate(-50%, 0);
+      font-family: "Noto Sans SC", sans-serif;
+      font-size: 12px;
+      color: rgba(232, 236, 242, 0.45);
+      letter-spacing: 0.06em;
+      padding: 6px 14px;
+      border: 0.5px dashed rgba(255, 255, 255, 0.15);
+      border-radius: 14px;
+      pointer-events: none;
+      transition: opacity 200ms;
+    }
+  </style>
+</head>
+<body>
+  <div id="stage" style="position:relative;width:100vw;height:100vh;cursor:default"></div>
+
+  <script type="module">
+    import * as THREE from 'three';
+    import { createEnvironment } from '/src/kit/Environment.js';
+    import { createPanel }       from '/src/kit/Hud.js';
+    import { orbitCamera }       from '/src/kit/CameraRig.js';
+    import { labels }            from '/src/kit/labels.js';
+    import { theme, hexToCss }   from '/src/kit/theme.js';
+
+    const C = labels.ch01.coupling;
+
+    // --- Graph model ------------------------------------------------------
+    // Four nodes placed at the corners of a 6×6 square in the xz plane.
+    // Colors follow the deck's semantic palette, with magenta standing in
+    // for localization since the palette has no dedicated localization hue.
+    const NODES = [
+      { key: 'perception', label: C.perception, pos: new THREE.Vector3(-3, 0.5, -2.5), color: theme.colors.perception },
+      { key: 'localization', label: C.localization, pos: new THREE.Vector3(-3, 0.5,  2.5), color: theme.colors.executed   },
+      { key: 'planning',   label: C.planning,   pos: new THREE.Vector3( 3, 0.5, -2.5), color: theme.colors.planning   },
+      { key: 'control',    label: C.control,    pos: new THREE.Vector3( 3, 0.5,  2.5), color: theme.colors.control    },
+    ];
+    const N_BY_KEY = Object.fromEntries(NODES.map((n, i) => [n.key, i]));
+
+    // Real autonomy-stack coupling, intentionally not a tree:
+    //   perception → localization   (features for VIO)
+    //   perception → planning     (obstacles)
+    //   localization → planning     (current pose)
+    //   localization → control      (feedback state)
+    //   planning   → control      (reference trajectory)
+    //   control    → localization   (control input for EKF prediction)
+    // The last one is the teaching-point feedback loop — layers are not
+    // a one-way pipeline.
+    const EDGES = [
+      ['perception', 'localization', 0.0],
+      ['perception', 'planning',   0.0],
+      ['localization', 'planning',   0.0],
+      ['localization', 'control',    +0.35],
+      ['control',    'localization', -0.35],
+      ['planning',   'control',    0.0],
+    ];
+
+    // --- Scene + renderer -------------------------------------------------
+    const { scene, addLights, dispose: disposeEnv } = createEnvironment({
+      theme: 'dark', grid: true, fog: true, floor: true, sceneSize: 30,
+    });
+    addLights();
+
+    const stage = document.getElementById('stage');
+    const camera = new THREE.PerspectiveCamera(
+      50, stage.clientWidth / stage.clientHeight, 0.1, 200,
+    );
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setSize(stage.clientWidth, stage.clientHeight);
+    renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+    stage.appendChild(renderer.domElement);
+
+    // --- Node spheres -----------------------------------------------------
+    const nodeGeo = new THREE.SphereGeometry(0.42, 28, 20);
+    const nodeMeshes = [];
+    for (const n of NODES) {
+      const mat = new THREE.MeshBasicMaterial({ color: n.color, transparent: true, opacity: 0.92 });
+      const mesh = new THREE.Mesh(nodeGeo, mat);
+      mesh.position.copy(n.pos);
+      mesh.userData.key = n.key;
+      scene.add(mesh);
+
+      // Halo ring around each node so they read as "slots in the graph" even
+      // when dimmed during a selection.
+      const ringGeo = new THREE.RingGeometry(0.55, 0.62, 48);
+      const ringMat = new THREE.MeshBasicMaterial({ color: n.color, transparent: true, opacity: 0.35, side: THREE.DoubleSide });
+      const ring = new THREE.Mesh(ringGeo, ringMat);
+      ring.rotation.x = -Math.PI / 2;
+      ring.position.copy(n.pos).y = 0.02;
+      scene.add(ring);
+
+      nodeMeshes.push({ mesh, ring, mat, ringMat, ringGeo, key: n.key });
+    }
+
+    // --- DOM node labels --------------------------------------------------
+    const nodeLabels = NODES.map((n) => {
+      const el = document.createElement('div');
+      el.className = 'node-label';
+      el.style.setProperty('--node-accent', hexToCss(n.color));
+      el.textContent = n.label;
+      stage.appendChild(el);
+      return el;
+    });
+
+    // --- Edges: curves, lines, and flowing particles ---------------------
+    // Each edge is a quadratic Bezier in 3D: up-arched so it reads as a
+    // flight path rather than a flat graph edge. The third entry in EDGES
+    // is a lateral offset used to split bi-directional pairs apart so they
+    // don't overlap.
+    function makeCurve(a, b, sideOffset = 0, liftY = 1.0) {
+      const mid = new THREE.Vector3().addVectors(a, b).multiplyScalar(0.5);
+      mid.y += liftY;
+      const dir = new THREE.Vector3().subVectors(b, a);
+      dir.y = 0; dir.normalize();
+      const perp = new THREE.Vector3(-dir.z, 0, dir.x).multiplyScalar(sideOffset);
+      mid.add(perp);
+      return new THREE.QuadraticBezierCurve3(a.clone(), mid, b.clone());
+    }
+
+    const edges = EDGES.map(([srcKey, dstKey, offset]) => {
+      const s = NODES[N_BY_KEY[srcKey]];
+      const d = NODES[N_BY_KEY[dstKey]];
+      const curve = makeCurve(s.pos, d.pos, offset, 1.1);
+
+      const linePts = curve.getPoints(48);
+      const lineGeo = new THREE.BufferGeometry().setFromPoints(linePts);
+      const lineMat = new THREE.LineBasicMaterial({ color: s.color, transparent: true, opacity: 0.25 });
+      const line = new THREE.Line(lineGeo, lineMat);
+      scene.add(line);
+
+      // Flowing particles along the curve.
+      const N = 5;
+      const positions = new Float32Array(N * 3);
+      const progress = new Float32Array(N);
+      for (let i = 0; i < N; i++) progress[i] = i / N;
+      const pGeo = new THREE.BufferGeometry();
+      pGeo.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+      const pMat = new THREE.PointsMaterial({
+        color: s.color, size: 0.22, transparent: true, opacity: 0.95,
+        map: makeSprite(), blending: THREE.AdditiveBlending,
+        depthWrite: false, sizeAttenuation: true,
+      });
+      const points = new THREE.Points(pGeo, pMat);
+      scene.add(points);
+
+      return {
+        src: srcKey, dst: dstKey, curve,
+        line, lineGeo, lineMat,
+        points, pGeo, pMat, positions, progress, N,
+        speed: 0.22,
+      };
+    });
+
+    function makeSprite() {
+      const c = document.createElement('canvas');
+      c.width = c.height = 64;
+      const ctx = c.getContext('2d');
+      const g = ctx.createRadialGradient(32, 32, 0, 32, 32, 30);
+      g.addColorStop(0.00, 'rgba(255,255,255,1)');
+      g.addColorStop(0.35, 'rgba(255,255,255,0.5)');
+      g.addColorStop(1.00, 'rgba(255,255,255,0)');
+      ctx.fillStyle = g;
+      ctx.fillRect(0, 0, 64, 64);
+      const tex = new THREE.CanvasTexture(c);
+      tex.colorSpace = THREE.SRGBColorSpace;
+      return tex;
+    }
+
+    // --- HUD --------------------------------------------------------------
+    const nodesPanel = createPanel({
+      title: C.panelTitle,
+      corner: 'tl', color: 'cyan',
+      items: NODES.map(n => ({ key: n.key, label: n.label, value: '—' })),
+    });
+    stage.appendChild(nodesPanel.el);
+
+    // Tint each row's value dot with the node's own color so the legend
+    // matches the on-scene palette at a glance.
+    const valueEls = nodesPanel.el.querySelectorAll('.hud-value');
+    NODES.forEach((n, i) => {
+      if (!valueEls[i]) return;
+      valueEls[i].textContent = '●';
+      valueEls[i].style.color = hexToCss(n.color);
+    });
+
+    const detailPanel = createPanel({
+      title: C.detailTitle,
+      corner: 'tr', color: 'cyan',
+      items: [
+        { key: 'sel', label: C.selected, value: C.none },
+        { key: 'in',  label: C.inputs,   value: C.none },
+        { key: 'out', label: C.outputs,  value: C.none },
+      ],
+    });
+    stage.appendChild(detailPanel.el);
+
+    const hint = document.createElement('div');
+    hint.className = 'hint';
+    hint.textContent = C.hintIdle;
+    stage.appendChild(hint);
+
+    // --- Selection + hover ------------------------------------------------
+    const raycaster = new THREE.Raycaster();
+    const mouse = new THREE.Vector2();
+    let hovered = null;   // key or null
+    let selected = null;  // key or null
+
+    function updateMouseFromEvent(e) {
+      const rect = renderer.domElement.getBoundingClientRect();
+      mouse.x = ((e.clientX - rect.left) / rect.width) * 2 - 1;
+      mouse.y = -((e.clientY - rect.top) / rect.height) * 2 + 1;
+    }
+
+    function pickNode() {
+      raycaster.setFromCamera(mouse, camera);
+      const hits = raycaster.intersectObjects(nodeMeshes.map(n => n.mesh), false);
+      return hits.length ? hits[0].object.userData.key : null;
+    }
+
+    renderer.domElement.addEventListener('pointermove', (e) => {
+      updateMouseFromEvent(e);
+      hovered = pickNode();
+      stage.style.cursor = hovered ? 'pointer' : 'default';
+    });
+
+    renderer.domElement.addEventListener('pointerdown', (e) => {
+      if (e.button !== 0) return;
+      updateMouseFromEvent(e);
+      const hit = pickNode();
+      selected = hit ? (hit === selected ? null : hit) : null;
+      applySelection();
+    });
+
+    function applySelection() {
+      hint.style.opacity = selected ? '0' : '1';
+
+      if (!selected) {
+        detailPanel.setValue('sel', C.none);
+        detailPanel.setValue('in',  C.none);
+        detailPanel.setValue('out', C.none);
+        return;
+      }
+      const sel = NODES[N_BY_KEY[selected]];
+      const ins = edges.filter(e => e.dst === selected).map(e => NODES[N_BY_KEY[e.src]].label);
+      const outs = edges.filter(e => e.src === selected).map(e => NODES[N_BY_KEY[e.dst]].label);
+      detailPanel.setValue('sel', sel.label);
+      detailPanel.setValue('in',  ins.length  ? ins.join('、')  : C.none);
+      detailPanel.setValue('out', outs.length ? outs.join('、') : C.none);
+    }
+
+    // --- Main loop --------------------------------------------------------
+    const clock = new THREE.Clock();
+    const orbitTarget = new THREE.Vector3(0, 0.5, 0);
+    const projVec = new THREE.Vector3();
+    const tmpPt = new THREE.Vector3();
+
+    (function tick() {
+      const dt = Math.min(0.05, clock.getDelta());
+      const tNow = performance.now() * 0.001;
+
+      // Advance particles per edge.
+      for (const e of edges) {
+        for (let i = 0; i < e.N; i++) {
+          e.progress[i] = (e.progress[i] + e.speed * dt) % 1;
+          e.curve.getPointAt(e.progress[i], tmpPt);
+          e.positions[i * 3 + 0] = tmpPt.x;
+          e.positions[i * 3 + 1] = tmpPt.y;
+          e.positions[i * 3 + 2] = tmpPt.z;
+        }
+        e.pGeo.attributes.position.needsUpdate = true;
+      }
+
+      // Node pulse (idle life) + highlight per selection.
+      for (let i = 0; i < NODES.length; i++) {
+        const key = NODES[i].key;
+        const isSelected  = selected === key;
+        const isConnected = selected && edges.some(e =>
+          (e.src === selected && e.dst === key) ||
+          (e.dst === selected && e.src === key));
+        const isActive = !selected || isSelected || isConnected;
+        const isHover  = hovered === key;
+
+        const basePulse = 0.88 + Math.sin(tNow * 2 + i) * 0.06;
+        const opacity = isActive ? (isSelected ? 1.0 : basePulse) : 0.28;
+        nodeMeshes[i].mat.opacity = opacity;
+        nodeMeshes[i].ringMat.opacity = isActive ? (isSelected ? 0.7 : 0.35) : 0.08;
+        const scale = isSelected ? 1.3 : (isHover && !selected ? 1.15 : 1.0);
+        nodeMeshes[i].mesh.scale.setScalar(scale);
+
+        const el = nodeLabels[i];
+        el.classList.toggle('active', isSelected || (isHover && !selected));
+        el.classList.toggle('dim',    !isActive);
+      }
+
+      // Edge opacity per selection.
+      for (const e of edges) {
+        const relevant = !selected || e.src === selected || e.dst === selected;
+        e.lineMat.opacity = relevant ? 0.55 : 0.06;
+        e.pMat.opacity    = relevant ? 0.95 : 0.08;
+      }
+
+      // Slow orbit — 60s per revolution.
+      orbitCamera(camera, {
+        target: orbitTarget, radius: 8.5, height: 5.0,
+        speed: (2 * Math.PI) / 60,
+      });
+
+      // Project node labels → screen (rounded px + translate3d).
+      const w = stage.clientWidth, h = stage.clientHeight;
+      for (let i = 0; i < NODES.length; i++) {
+        projVec.copy(NODES[i].pos); projVec.y += 0.85;
+        projVec.project(camera);
+        const x = Math.round( (projVec.x * 0.5 + 0.5) * w);
+        const y = Math.round((-projVec.y * 0.5 + 0.5) * h);
+        const visible = projVec.z > -1 && projVec.z < 1;
+        const el = nodeLabels[i];
+        el.style.transform = `translate3d(${x}px, ${y}px, 0) translate(-50%, -50%)`;
+        el.style.opacity = visible ? (el.classList.contains('dim') ? '0.35' : '1') : '0';
+      }
+
+      renderer.render(scene, camera);
+      requestAnimationFrame(tick);
+    })();
+
+    // --- Resize + dispose -------------------------------------------------
+    addEventListener('resize', () => {
+      camera.aspect = stage.clientWidth / stage.clientHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(stage.clientWidth, stage.clientHeight);
+    });
+
+    addEventListener('beforeunload', () => {
+      nodeGeo.dispose();
+      for (const n of nodeMeshes) { n.mat.dispose(); n.ringGeo.dispose(); n.ringMat.dispose(); }
+      for (const e of edges) {
+        e.lineGeo.dispose(); e.lineMat.dispose();
+        e.pGeo.dispose();    e.pMat.dispose();
+      }
+      for (const l of nodeLabels) l.remove();
+      hint.remove();
+      nodesPanel.dispose(); detailPanel.dispose();
+      disposeEnv();
+      renderer.dispose();
+    });
+  </script>
+</body>
+</html>

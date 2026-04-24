@@ -52,6 +52,22 @@ export const labels = {
       // viewer might assume the pyramid's visual blur is artistic.
       note: '转速反映真实频率比 · 控制环约 33× 感知环',
     },
+    coupling: {
+      panelTitle:    '模块耦合',
+      nodesTitle:    '节点',
+      detailTitle:   '节点详情',
+      hintIdle:      '点击节点 · 查看输入与输出',
+      selected:      '已选中',
+      inputs:        '输入',
+      outputs:       '输出',
+      none:          '—',
+      // Node role names — kept distinct from labels.layers.* which carry
+      // the '层' suffix used by the autonomy-stack scene.
+      perception:    '感知',
+      localization:  '定位',
+      planning:      '规划',
+      control:       '控制',
+    },
   },
   ch02: {
     explodedTitle:     '四旋翼组件',
