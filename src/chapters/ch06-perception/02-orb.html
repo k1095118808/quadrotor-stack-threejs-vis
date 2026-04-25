@@ -1,0 +1,683 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Ch6 · ORB 特征匹配</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+SC:wght@300;400;500;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/src/kit/hud.css">
+  <style>
+    /* ORB feature matching. No Three.js — two side-by-side synthetic image
+     * panels rendered with Canvas2D, plus an overlay canvas spanning the
+     * full stage for keypoints and match lines. Each scene authors a few
+     * geometric primitives in "scene coordinates" (= left-panel coords);
+     * the right panel re-renders the same primitives under a small affine
+     * (pan + rotation + scale around the centre) so the viewer reads the
+     * second view as a slightly-displaced camera. Keypoints are derived
+     * once per scene: corners of every primitive, with a fraction of the
+     * matches deliberately corrupted to simulate descriptor noise — these
+     * are the outliers RANSAC then rejects. */
+
+    html, body { margin: 0; background: var(--stage-bg); color: var(--label-strong-fg);
+                 font-family: "Noto Sans SC", sans-serif; overflow: hidden; }
+    #stage { position: relative; width: 100vw; height: 100vh; }
+    /* Two image-panel canvases sit beneath the overlay; the overlay canvas
+     * spans the full stage so match lines can cross the gap between panels. */
+    canvas.panel { position: absolute; top: 0; height: 100vh; }
+    canvas.overlay {
+      position: absolute; left: 0; top: 0; width: 100vw; height: 100vh;
+      pointer-events: none;
+    }
+    .panel-tag {
+      position: absolute; top: 14px;
+      font-family: "JetBrains Mono", monospace;
+      font-size: 10px;
+      color: var(--label-fg); background: var(--label-bg);
+      border: 0.5px solid var(--label-border);
+      border-radius: 3px;
+      padding: 4px 9px;
+      pointer-events: none;
+      letter-spacing: 0.05em;
+      z-index: 6;
+    }
+    #note {
+      position: absolute; left: 50%; transform: translateX(-50%);
+      top: 14px;
+      font-family: "JetBrains Mono", monospace;
+      font-size: 11px;
+      color: var(--label-fg); background: var(--label-bg);
+      border: 0.5px solid var(--label-border);
+      border-radius: 3px;
+      padding: 5px 12px;
+      pointer-events: none;
+      z-index: 7;
+    }
+    #legend {
+      position: absolute; bottom: 16px; left: 16px;
+      font-family: "JetBrains Mono", monospace;
+      font-size: 11px;
+      color: var(--label-fg); background: var(--label-bg);
+      border: 0.5px solid var(--label-border);
+      border-radius: 6px;
+      padding: 8px 12px;
+      pointer-events: none;
+      letter-spacing: 0.02em;
+      line-height: 1.7;
+      z-index: 6;
+    }
+    #legend .row { display: flex; align-items: center; gap: 8px; }
+    #legend .swatch {
+      display: inline-block; width: 14px; height: 10px; border-radius: 2px;
+      border: 0.5px solid var(--label-border);
+    }
+    #hint {
+      position: absolute; bottom: 18px; right: 56px;
+      font-family: "JetBrains Mono", monospace;
+      font-size: 10px;
+      color: var(--hud-unit);
+      pointer-events: none;
+      z-index: 6;
+    }
+  </style>
+</head>
+<body>
+  <div id="stage">
+    <canvas class="panel"   id="panel-left"></canvas>
+    <canvas class="panel"   id="panel-right"></canvas>
+    <canvas class="overlay" id="overlay"></canvas>
+    <div class="panel-tag" id="tag-left"></div>
+    <div class="panel-tag" id="tag-right"></div>
+    <div id="note"></div>
+    <div id="legend"></div>
+    <div id="hint"></div>
+  </div>
+
+  <script type="module">
+    import { createPanel } from '/src/kit/Hud.js';
+    import { labels }      from '/src/kit/labels.js';
+    import { theme, mountThemeToggle, hexToCss } from '/src/kit/theme.js';
+
+    const L = labels.ch06.orb;
+    document.getElementById('note').textContent  = L.note;
+    document.getElementById('hint').textContent  = L.hint;
+    document.getElementById('tag-left').textContent  = L.panelLeft;
+    document.getElementById('tag-right').textContent = L.panelRight;
+
+    mountThemeToggle();
+
+    // --- Layout -------------------------------------------------------------
+    // Both panels share the same CSS-pixel size; backing canvases are scaled
+    // by devicePixelRatio for crisp lines on HiDPI displays.
+    const stage = document.getElementById('stage');
+    const overlayEl = document.getElementById('overlay');
+    const leftEl    = document.getElementById('panel-left');
+    const rightEl   = document.getElementById('panel-right');
+    const dpr = Math.min(window.devicePixelRatio || 1, 2);
+    const PANEL_GAP = 14;
+
+    let stageW = 0, stageH = 0, panelW = 0, panelH = 0;
+    function layout() {
+      stageW = stage.clientWidth;
+      stageH = stage.clientHeight;
+      panelW = Math.floor((stageW - PANEL_GAP) / 2);
+      panelH = stageH;
+      const leftX = 0;
+      const rightX = panelW + PANEL_GAP;
+      for (const [el, x] of [[leftEl, leftX], [rightEl, rightX]]) {
+        el.style.left = x + 'px';
+        el.style.width = panelW + 'px';
+        el.width  = Math.floor(panelW * dpr);
+        el.height = Math.floor(panelH * dpr);
+        el.getContext('2d').setTransform(dpr, 0, 0, dpr, 0, 0);
+      }
+      overlayEl.width  = Math.floor(stageW * dpr);
+      overlayEl.height = Math.floor(stageH * dpr);
+      overlayEl.getContext('2d').setTransform(dpr, 0, 0, dpr, 0, 0);
+      // Tag positions match panel offsets.
+      document.getElementById('tag-left').style.left  = (leftX + 16) + 'px';
+      document.getElementById('tag-right').style.left = (rightX + 16) + 'px';
+    }
+    layout();
+    addEventListener('resize', () => { layout(); renderStaticPanels(); });
+
+    // --- Theme palette → CSS strings ---------------------------------------
+    const C_INLIER  = hexToCss(theme.colors.perception);
+    const C_OUTLIER = hexToCss(theme.colors.executed);
+    const C_KEY     = hexToCss(theme.colors.planning);
+    const C_OBS     = hexToCss(theme.colors.obstacle);
+    const C_AMBER   = hexToCss(theme.colors.control);
+    const C_BG_SKY  = theme.mode === 'light' ? '#eaf0fa' : '#0e1420';
+    const C_BG_GND  = theme.mode === 'light' ? '#dde4f0' : '#141a26';
+    const C_INK     = theme.mode === 'light' ? 'rgba(26,35,50,0.85)'
+                                             : 'rgba(232,236,242,0.85)';
+    const C_INK_SOFT= theme.mode === 'light' ? 'rgba(26,35,50,0.55)'
+                                             : 'rgba(232,236,242,0.45)';
+
+    // --- Affine transform helper -------------------------------------------
+    // Right panel applies a small pan/rotate/scale around the panel centre,
+    // so the right view reads as the same scene from a slightly different
+    // camera. The same transform is used to map left-panel keypoints to
+    // their (true) right-panel correspondences.
+    function applyTransform(p, T) {
+      const { tx, ty, rot, scale, cx, cy } = T;
+      const dx = p.x - cx, dy = p.y - cy;
+      const cs = Math.cos(rot), sn = Math.sin(rot);
+      const rx = (dx * cs - dy * sn) * scale;
+      const ry = (dx * sn + dy * cs) * scale;
+      return { x: cx + rx + tx, y: cy + ry + ty };
+    }
+
+    // --- Scene authoring ----------------------------------------------------
+    // Each scene returns an object with:
+    //   name:    Chinese scene label
+    //   draw:    (ctx, w, h) => void   — paints the synthetic image at the
+    //                                    current canvas transform
+    //   keypts:  [{ x, y }]            — keypoint positions in panel-local
+    //                                    (= left-panel) coordinates
+    //   transform: affine to apply for the right view
+    //   outlierIdx: Set<number>         — indices into keypts that are bad
+    //                                    matches (right-panel coord scrambled)
+    // The outlier scramble is computed at scene-build time so the on-screen
+    // chaos is deterministic and viewers can rewatch the same loop.
+
+    function rectCorners(x, y, w, h) {
+      return [
+        { x: x,     y: y     },
+        { x: x + w, y: y     },
+        { x: x + w, y: y + h },
+        { x: x,     y: y + h },
+      ];
+    }
+
+    function strokedRect(ctx, x, y, w, h, fill, stroke) {
+      if (fill)   { ctx.fillStyle   = fill;   ctx.fillRect(x, y, w, h); }
+      if (stroke) { ctx.strokeStyle = stroke; ctx.lineWidth = 1.4; ctx.strokeRect(x, y, w, h); }
+    }
+
+    function fillCircle(ctx, x, y, r, fill) {
+      ctx.beginPath(); ctx.arc(x, y, r, 0, Math.PI * 2); ctx.fillStyle = fill; ctx.fill();
+    }
+
+    // -- Scene 1: city street -----------------------------------------------
+    function makeCityScene(W, H) {
+      const horizon = H * 0.62;
+      const buildings = [
+        { x: W * 0.06, y: H * 0.18, w: W * 0.16, h: horizon - H * 0.18 },
+        { x: W * 0.24, y: H * 0.30, w: W * 0.18, h: horizon - H * 0.30 },
+        { x: W * 0.46, y: H * 0.10, w: W * 0.20, h: horizon - H * 0.10 },
+        { x: W * 0.70, y: H * 0.26, w: W * 0.22, h: horizon - H * 0.26 },
+      ];
+      const cars = [
+        { x: W * 0.14, y: horizon + H * 0.14, w: W * 0.12, h: H * 0.06 },
+        { x: W * 0.55, y: horizon + H * 0.08, w: W * 0.10, h: H * 0.05 },
+      ];
+
+      function draw(ctx, w, h) {
+        // sky / ground
+        ctx.fillStyle = C_BG_SKY;
+        ctx.fillRect(0, 0, w, horizon);
+        ctx.fillStyle = C_BG_GND;
+        ctx.fillRect(0, horizon, w, h - horizon);
+        // horizon line
+        ctx.strokeStyle = C_INK_SOFT; ctx.lineWidth = 0.8;
+        ctx.beginPath(); ctx.moveTo(0, horizon); ctx.lineTo(w, horizon); ctx.stroke();
+        // buildings
+        for (const b of buildings) {
+          strokedRect(ctx, b.x, b.y, b.w, b.h, C_OBS, C_INK);
+          // window grid — purely decorative.
+          const cols = 4, rows = Math.max(3, Math.floor(b.h / 32));
+          ctx.fillStyle = C_INK_SOFT;
+          for (let i = 0; i < cols; i++) {
+            for (let j = 0; j < rows; j++) {
+              ctx.fillRect(
+                b.x + b.w * (0.18 + i * 0.18),
+                b.y + b.h * (0.10 + j / rows * 0.85),
+                b.w * 0.10, 6,
+              );
+            }
+          }
+        }
+        // cars (rounded-ish rectangles)
+        for (const c of cars) {
+          strokedRect(ctx, c.x, c.y, c.w, c.h, C_AMBER, C_INK);
+        }
+        // road dashes
+        ctx.strokeStyle = C_INK_SOFT; ctx.setLineDash([12, 8]); ctx.lineWidth = 1.5;
+        ctx.beginPath(); ctx.moveTo(0, horizon + (h - horizon) * 0.55);
+        ctx.lineTo(w, horizon + (h - horizon) * 0.55); ctx.stroke();
+        ctx.setLineDash([]);
+      }
+
+      const keypts = [];
+      for (const b of buildings) keypts.push(...rectCorners(b.x, b.y, b.w, b.h));
+      for (const c of cars)      keypts.push(...rectCorners(c.x, c.y, c.w, c.h));
+
+      return { name: '街景 · City Block', draw, keypts };
+    }
+
+    // -- Scene 2: desk -------------------------------------------------------
+    function makeDeskScene(W, H) {
+      const deskTop = H * 0.42;
+      const monitor   = { x: W * 0.30, y: H * 0.16, w: W * 0.32, h: H * 0.22 };
+      const keyboard  = { x: W * 0.28, y: H * 0.46, w: W * 0.36, h: H * 0.06 };
+      const books = [
+        { x: W * 0.66, y: H * 0.22, w: W * 0.04, h: H * 0.20 },
+        { x: W * 0.71, y: H * 0.18, w: W * 0.05, h: H * 0.24 },
+        { x: W * 0.77, y: H * 0.26, w: W * 0.04, h: H * 0.16 },
+      ];
+      const mug = { x: W * 0.16, y: H * 0.30, r: H * 0.06 };
+
+      function draw(ctx, w, h) {
+        ctx.fillStyle = C_BG_SKY;
+        ctx.fillRect(0, 0, w, deskTop);
+        ctx.fillStyle = C_BG_GND;
+        ctx.fillRect(0, deskTop, w, h - deskTop);
+        // back wall line
+        ctx.strokeStyle = C_INK_SOFT; ctx.lineWidth = 0.8;
+        ctx.beginPath(); ctx.moveTo(0, deskTop); ctx.lineTo(w, deskTop); ctx.stroke();
+        // monitor
+        strokedRect(ctx, monitor.x, monitor.y, monitor.w, monitor.h, C_OBS, C_INK);
+        ctx.fillStyle = C_INK_SOFT;
+        ctx.fillRect(monitor.x + monitor.w * 0.06, monitor.y + monitor.h * 0.12,
+                     monitor.w * 0.88, monitor.h * 0.72);
+        // monitor stand
+        ctx.strokeStyle = C_INK; ctx.lineWidth = 2;
+        const sx = monitor.x + monitor.w / 2, sy = monitor.y + monitor.h;
+        ctx.beginPath(); ctx.moveTo(sx, sy); ctx.lineTo(sx, sy + H * 0.04);
+        ctx.lineTo(sx - W * 0.04, sy + H * 0.04);
+        ctx.lineTo(sx + W * 0.04, sy + H * 0.04); ctx.stroke();
+        // keyboard
+        strokedRect(ctx, keyboard.x, keyboard.y, keyboard.w, keyboard.h, C_OBS, C_INK);
+        // books
+        for (const b of books) strokedRect(ctx, b.x, b.y, b.w, b.h, C_AMBER, C_INK);
+        // mug
+        ctx.beginPath(); ctx.arc(mug.x, mug.y, mug.r, 0, Math.PI * 2);
+        ctx.fillStyle = C_OBS; ctx.fill();
+        ctx.strokeStyle = C_INK; ctx.lineWidth = 1.4; ctx.stroke();
+        // mug handle
+        ctx.beginPath(); ctx.arc(mug.x + mug.r, mug.y, mug.r * 0.45, -Math.PI/2, Math.PI/2);
+        ctx.stroke();
+      }
+
+      const keypts = [];
+      keypts.push(...rectCorners(monitor.x, monitor.y, monitor.w, monitor.h));
+      keypts.push(...rectCorners(keyboard.x, keyboard.y, keyboard.w, keyboard.h));
+      for (const b of books) keypts.push(...rectCorners(b.x, b.y, b.w, b.h));
+      // mug — sample 4 cardinal points.
+      keypts.push(
+        { x: mug.x + mug.r, y: mug.y },
+        { x: mug.x - mug.r, y: mug.y },
+        { x: mug.x, y: mug.y + mug.r },
+        { x: mug.x, y: mug.y - mug.r },
+      );
+      return { name: '桌面 · Desk', draw, keypts };
+    }
+
+    // -- Scene 3: facade -----------------------------------------------------
+    function makeFacadeScene(W, H) {
+      const cols = 6, rows = 5;
+      const padX = W * 0.10, padY = H * 0.12;
+      const gridW = W - 2 * padX, gridH = H - 2 * padY;
+      const cellW = gridW / cols, cellH = gridH / rows;
+      const winW = cellW * 0.62, winH = cellH * 0.58;
+
+      const windows = [];
+      for (let j = 0; j < rows; j++) for (let i = 0; i < cols; i++) {
+        windows.push({
+          x: padX + i * cellW + (cellW - winW) / 2,
+          y: padY + j * cellH + (cellH - winH) / 2,
+          w: winW, h: winH,
+        });
+      }
+
+      function draw(ctx, w, h) {
+        // facade body
+        ctx.fillStyle = C_BG_GND;
+        ctx.fillRect(0, 0, w, h);
+        // ledge
+        ctx.strokeStyle = C_INK_SOFT; ctx.lineWidth = 0.8;
+        for (let j = 0; j <= rows; j++) {
+          const y = padY + j * cellH;
+          ctx.beginPath(); ctx.moveTo(padX, y); ctx.lineTo(w - padX, y); ctx.stroke();
+        }
+        for (const r of windows) {
+          ctx.fillStyle = C_BG_SKY;
+          ctx.fillRect(r.x, r.y, r.w, r.h);
+          ctx.strokeStyle = C_INK; ctx.lineWidth = 1.2;
+          ctx.strokeRect(r.x, r.y, r.w, r.h);
+          // mullion
+          ctx.beginPath();
+          ctx.moveTo(r.x + r.w / 2, r.y); ctx.lineTo(r.x + r.w / 2, r.y + r.h);
+          ctx.moveTo(r.x, r.y + r.h / 2); ctx.lineTo(r.x + r.w, r.y + r.h / 2);
+          ctx.stroke();
+        }
+      }
+
+      const keypts = [];
+      for (const r of windows) keypts.push(...rectCorners(r.x, r.y, r.w, r.h));
+      return { name: '建筑立面 · Facade', draw, keypts };
+    }
+
+    // -- Scene 4: park -------------------------------------------------------
+    function makeParkScene(W, H) {
+      const ground = H * 0.66;
+      const trees = [
+        { x: W * 0.14, y: ground, h: H * 0.40, r: H * 0.08 },
+        { x: W * 0.34, y: ground, h: H * 0.34, r: H * 0.07 },
+        { x: W * 0.78, y: ground, h: H * 0.42, r: H * 0.09 },
+      ];
+      const bench = { x: W * 0.50, y: ground - H * 0.04, w: W * 0.18, h: H * 0.04 };
+      const sign  = { x: W * 0.22, y: ground - H * 0.22, w: W * 0.06, h: H * 0.10 };
+
+      function draw(ctx, w, h) {
+        ctx.fillStyle = C_BG_SKY;
+        ctx.fillRect(0, 0, w, ground);
+        ctx.fillStyle = C_BG_GND;
+        ctx.fillRect(0, ground, w, h - ground);
+        ctx.strokeStyle = C_INK_SOFT; ctx.lineWidth = 0.8;
+        ctx.beginPath(); ctx.moveTo(0, ground); ctx.lineTo(w, ground); ctx.stroke();
+        // trees: trunk + canopy
+        for (const t of trees) {
+          ctx.strokeStyle = C_INK; ctx.lineWidth = 2.5;
+          ctx.beginPath(); ctx.moveTo(t.x, t.y); ctx.lineTo(t.x, t.y - t.h); ctx.stroke();
+          ctx.beginPath(); ctx.arc(t.x, t.y - t.h, t.r, 0, Math.PI * 2);
+          ctx.fillStyle = C_INLIER; ctx.fill();
+          ctx.strokeStyle = C_INK; ctx.lineWidth = 1.1; ctx.stroke();
+        }
+        // bench
+        strokedRect(ctx, bench.x, bench.y, bench.w, bench.h, C_AMBER, C_INK);
+        ctx.strokeStyle = C_INK; ctx.lineWidth = 1.5;
+        ctx.beginPath();
+        ctx.moveTo(bench.x + 4, bench.y + bench.h);
+        ctx.lineTo(bench.x + 4, bench.y + bench.h + H * 0.04);
+        ctx.moveTo(bench.x + bench.w - 4, bench.y + bench.h);
+        ctx.lineTo(bench.x + bench.w - 4, bench.y + bench.h + H * 0.04);
+        ctx.stroke();
+        // sign
+        strokedRect(ctx, sign.x, sign.y, sign.w, sign.h, C_OBS, C_INK);
+        ctx.strokeStyle = C_INK; ctx.lineWidth = 2;
+        ctx.beginPath();
+        ctx.moveTo(sign.x + sign.w / 2, sign.y + sign.h);
+        ctx.lineTo(sign.x + sign.w / 2, ground); ctx.stroke();
+      }
+
+      const keypts = [];
+      for (const t of trees) {
+        keypts.push({ x: t.x, y: t.y - t.h }); // trunk top
+        keypts.push({ x: t.x + t.r, y: t.y - t.h });
+        keypts.push({ x: t.x - t.r, y: t.y - t.h });
+        keypts.push({ x: t.x, y: t.y });        // base
+      }
+      keypts.push(...rectCorners(bench.x, bench.y, bench.w, bench.h));
+      keypts.push(...rectCorners(sign.x,  sign.y,  sign.w,  sign.h));
+      return { name: '公园 · Park', draw, keypts };
+    }
+
+    // --- Scene + match list assembly ---------------------------------------
+    // For a built scene, derive the right-panel correspondences and pick a
+    // handful of indices to scramble as outliers.
+    function buildScene(builder) {
+      const scene = builder(panelW, panelH);
+      // Right-view affine: small pan + small rotation + slight scale around centre.
+      const T = {
+        tx: panelW * 0.025,
+        ty: panelH * 0.012,
+        rot: 0.045,           // radians, ~2.6°
+        scale: 1.03,
+        cx: panelW / 2,
+        cy: panelH / 2,
+      };
+      const matches = scene.keypts.map((p) => {
+        const r = applyTransform(p, T);
+        return { xL: p.x, yL: p.y, xR: r.x, yR: r.y, outlier: false };
+      });
+      // Mark a deterministic subset as outliers (~22% — within real-ORB ranges).
+      const N = matches.length;
+      const outlierCount = Math.max(5, Math.floor(N * 0.22));
+      // Even-spaced sampling (with offset per scene) so the outliers spread
+      // visually rather than clumping.
+      const step = N / outlierCount;
+      const seedPhase = (scene.name.length * 31) % step;
+      for (let k = 0; k < outlierCount; k++) {
+        const idx = Math.floor(k * step + seedPhase) % N;
+        matches[idx].outlier = true;
+        // Scramble the right coord by a meaningful delta — not totally random,
+        // because real bad-descriptor matches still land somewhere on the image.
+        const angle = (idx * 137.5) * Math.PI / 180;
+        const radius = panelW * 0.18 + (idx * 7 % 60);
+        matches[idx].xR = matches[idx].xR + Math.cos(angle) * radius;
+        matches[idx].yR = matches[idx].yR + Math.sin(angle) * radius;
+        // Clamp to panel so the line doesn't fly off-screen.
+        matches[idx].xR = clamp(matches[idx].xR, 8, panelW - 8);
+        matches[idx].yR = clamp(matches[idx].yR, 8, panelH - 8);
+      }
+      return { ...scene, transform: T, matches };
+    }
+
+    function clamp(v, lo, hi) { return v < lo ? lo : v > hi ? hi : v; }
+
+    // --- Static panel rendering --------------------------------------------
+    // Background images change only when (a) layout changes, or (b) the scene
+    // index advances. Re-rendering them every frame would burn CPU drawing
+    // the same primitives repeatedly.
+    const SCENE_BUILDERS = [makeCityScene, makeDeskScene, makeFacadeScene, makeParkScene];
+    let scenes = [];
+    let currentSceneIdx = -1;
+
+    function rebuildScenes() {
+      scenes = SCENE_BUILDERS.map(buildScene);
+    }
+
+    function renderStaticPanels() {
+      rebuildScenes();
+      drawSceneBackgrounds(scenes[Math.max(0, currentSceneIdx)]);
+    }
+
+    function drawSceneBackgrounds(scene) {
+      const ctxL = leftEl.getContext('2d');
+      const ctxR = rightEl.getContext('2d');
+      ctxL.clearRect(0, 0, panelW, panelH);
+      ctxR.clearRect(0, 0, panelW, panelH);
+      // Left = identity transform.
+      scene.draw(ctxL, panelW, panelH);
+      // Right = apply scene transform around centre.
+      const T = scene.transform;
+      ctxR.save();
+      ctxR.translate(T.cx + T.tx, T.cy + T.ty);
+      ctxR.rotate(T.rot);
+      ctxR.scale(T.scale, T.scale);
+      ctxR.translate(-T.cx, -T.cy);
+      scene.draw(ctxR, panelW, panelH);
+      ctxR.restore();
+    }
+
+    // --- Overlay rendering (per frame) -------------------------------------
+    // Stage timeline within a single 10-s scene cycle:
+    //   0.0 – 0.6  scene image fades in
+    //   0.6 – 2.0  keypoints stagger-appear on both panels
+    //   2.0 – 4.5  match lines draw progressively
+    //   4.5 – 5.5  RANSAC: outliers flash red, then fade
+    //   5.5 – 9.4  hold (only inliers visible)
+    //   9.4 – 10.0 fade out before next scene
+    const T_KP_START   = 0.6;
+    const T_KP_END     = 2.0;
+    const T_MATCH_START= 2.0;
+    const T_MATCH_END  = 4.5;
+    const T_RANSAC     = 4.5;
+    const T_RANSAC_END = 5.5;
+    const T_HOLD_END   = 9.4;
+    const T_LOOP       = 10.0;
+
+    function lerp(a, b, t) { return a + (b - a) * t; }
+    function smoothstep(t) { t = clamp(t, 0, 1); return t * t * (3 - 2 * t); }
+
+    function renderOverlay(scene, t) {
+      const ctx = overlayEl.getContext('2d');
+      ctx.clearRect(0, 0, stageW, stageH);
+
+      const rightOffsetX = panelW + PANEL_GAP;
+      const N = scene.matches.length;
+
+      // Keypoint visibility per index (stagger).
+      const kpVis = new Float32Array(N);
+      for (let i = 0; i < N; i++) {
+        const tk = T_KP_START + (i / N) * (T_KP_END - T_KP_START);
+        kpVis[i] = smoothstep((t - tk) / 0.25);
+      }
+
+      // Match line visibility (per inlier and per outlier).
+      const matchVis = new Float32Array(N);
+      for (let i = 0; i < N; i++) {
+        const tm = T_MATCH_START + (i / N) * (T_MATCH_END - T_MATCH_START);
+        matchVis[i] = smoothstep((t - tm) / 0.25);
+      }
+
+      // RANSAC outlier fade — outliers fade to zero between T_RANSAC and
+      // T_RANSAC_END; flash a brighter red at the start of the window so the
+      // viewer's eye is drawn to them before they vanish.
+      let outlierAlpha = 1;
+      let outlierFlash = 0;
+      if (t >= T_RANSAC) {
+        const u = clamp((t - T_RANSAC) / (T_RANSAC_END - T_RANSAC), 0, 1);
+        outlierAlpha = 1 - u;
+        outlierFlash = Math.sin(u * Math.PI) * 0.8;  // peaks mid-fade
+      }
+
+      // Final hold-fade: dim everything in the last 0.6 s before the next scene.
+      let globalAlpha = 1;
+      if (t >= T_HOLD_END) {
+        globalAlpha = 1 - clamp((t - T_HOLD_END) / (T_LOOP - T_HOLD_END), 0, 1);
+      }
+      ctx.globalAlpha = globalAlpha;
+
+      // -- Match lines (drawn first so dots layer on top) -----------------
+      for (let i = 0; i < N; i++) {
+        const m = scene.matches[i];
+        const v = matchVis[i];
+        if (v <= 0.01) continue;
+        let alpha = v;
+        let color = C_INLIER;
+        let width = 1.0;
+        if (m.outlier) {
+          alpha *= outlierAlpha;
+          color = C_OUTLIER;
+          width = 1.0 + outlierFlash * 1.5;
+          if (alpha < 0.02) continue;
+        }
+        ctx.strokeStyle = color;
+        ctx.globalAlpha = globalAlpha * alpha * 0.85;
+        ctx.lineWidth = width;
+        ctx.beginPath();
+        ctx.moveTo(m.xL, m.yL);
+        ctx.lineTo(rightOffsetX + m.xR, m.yR);
+        ctx.stroke();
+      }
+      ctx.globalAlpha = globalAlpha;
+
+      // -- Keypoint dots (both panels) ------------------------------------
+      for (let i = 0; i < N; i++) {
+        const m = scene.matches[i];
+        const v = kpVis[i];
+        if (v <= 0.01) continue;
+        let dotColor = C_KEY;
+        let alpha = v;
+        // After RANSAC, outlier dots desaturate alongside their lines.
+        if (m.outlier && t >= T_RANSAC) {
+          dotColor = C_OUTLIER;
+          alpha *= outlierAlpha;
+        }
+        if (alpha < 0.02) continue;
+        ctx.globalAlpha = globalAlpha * alpha;
+        const r = 3.4 + (m.outlier && t < T_RANSAC_END ? outlierFlash * 1.0 : 0);
+        // Left panel.
+        fillCircle(ctx, m.xL, m.yL, r, dotColor);
+        // Right panel.
+        fillCircle(ctx, rightOffsetX + m.xR, m.yR, r, dotColor);
+      }
+      ctx.globalAlpha = 1;
+    }
+
+    // --- HUD ----------------------------------------------------------------
+    // Stage indicator + match stats. Inlier/outlier counts come straight from
+    // the scene (so the numbers match what the viewer sees on screen).
+    const stagePanel = createPanel({
+      title: L.stagePanel, corner: 'tl', color: 'cyan',
+      items: [
+        { key: 'stage', label: '', value: L.stageDetect },
+      ],
+    });
+    stagePanel.el.style.top = '54px';   // below the panel-tag chip
+    stage.appendChild(stagePanel.el);
+
+    const statsPanel = createPanel({
+      title: L.statsPanel, corner: 'tr', color: 'magenta',
+      items: [
+        { key: 'scene',    label: L.sceneLabel, value: '—' },
+        { key: 'total',    label: L.total,      value: '0' },
+        { key: 'inliers',  label: L.inliers,    value: '0' },
+        { key: 'outliers', label: L.outliers,   value: '0' },
+        { key: 'method',   label: L.method,     value: 'RANSAC' },
+      ],
+    });
+    statsPanel.el.style.top = '54px';
+    stage.appendChild(statsPanel.el);
+
+    // Legend.
+    const legend = document.getElementById('legend');
+    function rowSwatch(css, text) {
+      const row = document.createElement('div'); row.className = 'row';
+      const sw = document.createElement('span'); sw.className = 'swatch';
+      sw.style.background = css;
+      const tx = document.createElement('span'); tx.textContent = text;
+      row.appendChild(sw); row.appendChild(tx); return row;
+    }
+    legend.appendChild(rowSwatch(C_KEY,     L.legendKp));
+    legend.appendChild(rowSwatch(C_INLIER,  L.legendInlier));
+    legend.appendChild(rowSwatch(C_OUTLIER, L.legendOutlier));
+
+    // --- Loop ---------------------------------------------------------------
+    let loopStart = performance.now() * 0.001;
+    rebuildScenes();
+    drawSceneBackgrounds(scenes[0]);
+    currentSceneIdx = 0;
+
+    (function tick() {
+      const now = performance.now() * 0.001;
+      const elapsed = now - loopStart;
+      const sceneIdx = Math.floor(elapsed / T_LOOP) % scenes.length;
+      const t = elapsed - Math.floor(elapsed / T_LOOP) * T_LOOP;
+
+      if (sceneIdx !== currentSceneIdx) {
+        currentSceneIdx = sceneIdx;
+        drawSceneBackgrounds(scenes[currentSceneIdx]);
+      }
+
+      const scene = scenes[currentSceneIdx];
+      renderOverlay(scene, t);
+
+      // Stage label.
+      let stageText;
+      if      (t < T_KP_END)      stageText = L.stageDetect;
+      else if (t < T_RANSAC)      stageText = L.stageMatch;
+      else if (t < T_RANSAC_END)  stageText = L.stageRansac;
+      else                        stageText = L.stageHold;
+      stagePanel.setValue('stage', stageText);
+
+      // Stats — show full counts during matching and after, drop outliers
+      // post-RANSAC so the numbers visibly tighten.
+      const N = scene.matches.length;
+      const inliers  = scene.matches.filter((m) => !m.outlier).length;
+      const outliers = N - inliers;
+      const showOutliers = t < T_RANSAC_END;
+      statsPanel.setValue('scene',    scene.name);
+      statsPanel.setValue('total',    String(showOutliers ? N : inliers));
+      statsPanel.setValue('inliers',  String(inliers));
+      statsPanel.setValue('outliers', String(showOutliers ? outliers : 0));
+
+      requestAnimationFrame(tick);
+    })();
+  </script>
+</body>
+</html>
