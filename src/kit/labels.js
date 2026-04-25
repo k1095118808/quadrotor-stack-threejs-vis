@@ -201,6 +201,76 @@ export const labels = {
       errorAxis:     '误差旋转轴',
     },
   },
+  ch05: {
+    searchTitle:    'A*/RRT* 搜索扩展',
+    minSnapTitle:   '最小 Snap 轨迹',
+    corridorTitle:  '安全飞行走廊',
+    search: {
+      // Two algorithms run back-to-back in a loop: A* first (grid fill with
+      // f-score gradient), then RRT* (random tree). Each phase ends in a
+      // path reveal where the drone flies the result.
+      algoPanel:     '当前算法',
+      statsPanel:    '统计',
+      legendPanel:   '图例',
+      hintBL:        '15 s 扩展 + 5 s 飞行 · 算法循环',
+      algoAStar:     'A* · 网格搜索',
+      algoRRT:       'RRT* · 随机树',
+      phaseExpand:   '扩展中',
+      phaseReveal:   '路径生成',
+      phaseFly:      '执飞',
+      nodes:         '节点探索',
+      pathLen:       '路径长度',
+      iters:         '迭代',
+      legendStart:   '起点',
+      legendGoal:    '终点',
+      legendObs:     '障碍',
+      legendPath:    '最终路径',
+      legendOpen:    '待扩展',
+      legendClosed:  '已扩展',
+      legendTree:    '随机树',
+      noteAStar:     '启发式 · 欧式距离 · 8 连通',
+      noteRRT:       '步长 1.5 m · 重接半径 1.8 m',
+    },
+    minSnap: {
+      // Two-mode demo that flips between piecewise-linear "naive" routing and
+      // a 7th-order polynomial spline that is C^6 continuous (uniquely
+      // determined → mathematically equivalent to minimum-snap when segment
+      // times are fixed). Side panels chart |a| and |jerk| to make the lurch
+      // vs. flow contrast quantitative.
+      modePanel:     '模式',
+      statsPanel:    '动态统计',
+      hintBL:        '4 路径点 · 12 s 每模式 · 自动循环',
+      modeNaive:     '直线连接',
+      modeSnap:      '最小 Snap · 7 阶样条',
+      legendNaive:   '直线轨迹',
+      legendSnap:    '最小 Snap',
+      legendActive:  '执飞',
+      accelPeak:     '加速度峰值',
+      jerkPeak:      '加加速度峰值',
+      accelChart:    '|a(t)|',
+      jerkChart:     '|j(t)|',
+      timeAxis:      '时间 t / s',
+      note:          '同等平均速度 · 同样路径点 · 不同轨迹平滑度',
+    },
+    corridor: {
+      // The trajectory plans a coarse path through obstacles, the kit inflates
+      // a chain of overlapping convex boxes around it (the "corridor"), and a
+      // smoothed trajectory is then constrained to live inside the corridor.
+      stagePanel:    '阶段',
+      statsPanel:    '走廊统计',
+      hintBL:        '直线 → 走廊 → 平滑轨迹',
+      stage1:        '初始直线路径',
+      stage2:        '膨胀凸多面体',
+      stage3:        '约束平滑',
+      stage4:        '执飞',
+      boxCount:      '凸盒数',
+      minClear:      '最小间隙',
+      legendInit:    '初始路径',
+      legendCorr:    '凸走廊',
+      legendSmooth:  '平滑轨迹',
+      note:          '将非凸避障松弛为凸约束',
+    },
+  },
   demo: {
     // Strings used only by src/kit-demo.html (Phase 0 acceptance test).
     title:     '工具包演示',

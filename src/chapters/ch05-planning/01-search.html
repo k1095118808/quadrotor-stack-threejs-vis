@@ -1,0 +1,748 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Ch5 · A*/RRT* 搜索扩展</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+SC:wght@300;400;500;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/src/kit/hud.css">
+  <style>
+    /* Top-down planning view. The world is functionally 2D — obstacles are
+     * extruded a few cm above the floor so the camera tilt reads as 3D, but
+     * the search itself runs on the (x, z) plane. Both algorithms are
+     * precomputed once at load so the timeline plays back deterministically;
+     * Math.random in RRT* is fine because the scene rebuilds on reload. */
+
+    html, body { margin: 0; background: var(--stage-bg); color: var(--label-strong-fg);
+                 font-family: "Noto Sans SC", sans-serif; overflow: hidden; }
+
+    #legend {
+      position: absolute; bottom: 16px; left: 16px;
+      font-family: "JetBrains Mono", monospace;
+      font-size: 11px;
+      color: var(--label-fg);
+      background: var(--label-bg);
+      border: 0.5px solid var(--label-border);
+      border-radius: 6px;
+      padding: 8px 12px;
+      pointer-events: none;
+      letter-spacing: 0.02em;
+      line-height: 1.7;
+    }
+    #legend .row { display: flex; align-items: center; gap: 8px; }
+    #legend .swatch {
+      display: inline-block; width: 14px; height: 10px; border-radius: 2px;
+      border: 0.5px solid var(--label-border);
+    }
+    #hint {
+      position: absolute; top: 24px; left: 50%; transform: translateX(-50%);
+      font-family: "JetBrains Mono", monospace;
+      font-size: 11px;
+      color: var(--label-fg);
+      background: var(--label-bg);
+      border: 0.5px solid var(--label-border);
+      border-radius: 3px;
+      padding: 5px 12px;
+      pointer-events: none;
+    }
+  </style>
+</head>
+<body>
+  <div id="stage" style="position:relative;width:100vw;height:100vh"></div>
+  <div id="hint"></div>
+  <div id="legend"></div>
+
+  <script type="module">
+    import * as THREE from 'three';
+    import { createEnvironment } from '/src/kit/Environment.js';
+    import { createDrone }       from '/src/kit/Quadrotor.js';
+    import { createTrail }       from '/src/kit/Trajectory.js';
+    import { createPanel }       from '/src/kit/Hud.js';
+    import { labels }            from '/src/kit/labels.js';
+    import { theme, mountThemeToggle, hexToCss } from '/src/kit/theme.js';
+
+    const L = labels.ch05.search;
+    document.getElementById('hint').textContent = L.hintBL;
+
+    // --- World layout ----------------------------------------------------
+    // Planar workspace; y is fixed at the floor. Obstacles are axis-aligned
+    // rectangles; their inflated grid cells are blocked.
+    const WORLD = { xMin: -10, xMax: 10, zMin: -5.5, zMax: 5.5 };
+    const START = { x: -9, z: -4 };
+    const GOAL  = { x:  9, z:  4 };
+    // Four vertical walls forming a serpentine. Each row is [xMin, xMax, zMin, zMax].
+    const OBSTACLES = [
+      [-6.5, -5.5, -1, 5.0],
+      [-2.5, -1.5, -5, 1.0],
+      [ 1.5,  2.5, -1, 5.0],
+      [ 5.5,  6.5, -5, 1.0],
+    ];
+
+    function inObstacle(x, z, margin = 0) {
+      for (const o of OBSTACLES) {
+        if (x >= o[0] - margin && x <= o[1] + margin &&
+            z >= o[2] - margin && z <= o[3] + margin) return true;
+      }
+      return false;
+    }
+
+    // --- Scene -----------------------------------------------------------
+    const stage = document.getElementById('stage');
+    const { scene, addLights, dispose: disposeEnv } = createEnvironment({
+      grid: true, fog: true, floor: true, sceneSize: 28, logoClouds: false,
+    });
+    addLights();
+    mountThemeToggle();
+
+    const camera = new THREE.PerspectiveCamera(38, stage.clientWidth / stage.clientHeight, 0.1, 80);
+    camera.position.set(0, 17, 8);
+    camera.lookAt(0, 0, 0);
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+    renderer.setSize(stage.clientWidth, stage.clientHeight);
+    stage.appendChild(renderer.domElement);
+
+    // Obstacles as low extruded boxes — 0.4 m tall, just enough that the
+    // shadow side reads in 3D under the tilted camera.
+    const obsMat = new THREE.MeshStandardMaterial({
+      color: theme.colors.obstacle, metalness: 0.1, roughness: 0.9,
+    });
+    const obsGroup = new THREE.Group();
+    for (const [x0, x1, z0, z1] of OBSTACLES) {
+      const geo = new THREE.BoxGeometry(x1 - x0, 0.4, z1 - z0);
+      const mesh = new THREE.Mesh(geo, obsMat);
+      mesh.position.set((x0 + x1) / 2, 0.2, (z0 + z1) / 2);
+      obsGroup.add(mesh);
+      mesh.userData.dispose = () => geo.dispose();
+    }
+    scene.add(obsGroup);
+
+    // Start (green) and goal (magenta) markers.
+    const startMat = new THREE.MeshStandardMaterial({ color: theme.colors.perception, emissive: theme.colors.perception, emissiveIntensity: 0.4 });
+    const goalMat  = new THREE.MeshStandardMaterial({ color: theme.colors.executed,   emissive: theme.colors.executed,   emissiveIntensity: 0.4 });
+    const startGeo = new THREE.CylinderGeometry(0.32, 0.32, 0.08, 24);
+    const goalGeo  = new THREE.CylinderGeometry(0.32, 0.32, 0.08, 24);
+    const startMesh = new THREE.Mesh(startGeo, startMat);
+    const goalMesh  = new THREE.Mesh(goalGeo,  goalMat);
+    startMesh.position.set(START.x, 0.04, START.z);
+    goalMesh.position.set(GOAL.x,  0.04, GOAL.z);
+    scene.add(startMesh, goalMesh);
+
+    // --- A* precomputation ----------------------------------------------
+    // 8-connected grid. Step 0.5 m → 40×22 = 880 cells. Cells whose centre
+    // lies inside any obstacle (with a half-cell inflation margin) are
+    // blocked — this prevents the path from clipping wall corners visually.
+    const STEP = 0.5;
+    const NX = Math.round((WORLD.xMax - WORLD.xMin) / STEP);
+    const NZ = Math.round((WORLD.zMax - WORLD.zMin) / STEP);
+
+    // Inflate obstacles by ~0.6 m so the smoothed flight curve through cell
+    // centres keeps clear of walls — naked clearance of half a cell would
+    // let Catmull-Rom corner-cutting clip the obstacle face visually.
+    const INFLATE = 0.55;
+    const blocked = new Uint8Array(NX * NZ);
+    for (let iz = 0; iz < NZ; iz++) {
+      for (let ix = 0; ix < NX; ix++) {
+        const x = WORLD.xMin + (ix + 0.5) * STEP;
+        const z = WORLD.zMin + (iz + 0.5) * STEP;
+        if (inObstacle(x, z, INFLATE)) blocked[iz * NX + ix] = 1;
+      }
+    }
+
+    function cellOf(p) {
+      const ix = Math.max(0, Math.min(NX - 1, Math.floor((p.x - WORLD.xMin) / STEP)));
+      const iz = Math.max(0, Math.min(NZ - 1, Math.floor((p.z - WORLD.zMin) / STEP)));
+      return [ix, iz];
+    }
+    function cellCenter(ix, iz) {
+      return { x: WORLD.xMin + (ix + 0.5) * STEP, z: WORLD.zMin + (iz + 0.5) * STEP };
+    }
+
+    function aStar(start, goal) {
+      const [sx, sz] = cellOf(start), [gx, gz] = cellOf(goal);
+      const N = NX * NZ;
+      const g = new Float64Array(N).fill(Infinity);
+      const f = new Float64Array(N).fill(Infinity);
+      const parent = new Int32Array(N).fill(-1);
+      const closed = new Uint8Array(N);
+      const heap = []; // simple binary heap of [f, idx]
+      const sIdx = sz * NX + sx, gIdx = gz * NX + gx;
+      g[sIdx] = 0; f[sIdx] = Math.hypot(gx - sx, gz - sz) * STEP;
+      heap.push([f[sIdx], sIdx]);
+      const order = []; // [{ idx, f }] in pop order
+
+      const NB = [
+        [+1, 0, 1], [-1, 0, 1], [0, +1, 1], [0, -1, 1],
+        [+1, +1, Math.SQRT2], [+1, -1, Math.SQRT2], [-1, +1, Math.SQRT2], [-1, -1, Math.SQRT2],
+      ];
+
+      function heapPush(item) { heap.push(item); siftUp(heap.length - 1); }
+      function heapPop() {
+        const top = heap[0];
+        const last = heap.pop();
+        if (heap.length > 0) { heap[0] = last; siftDown(0); }
+        return top;
+      }
+      function siftUp(i) {
+        while (i > 0) {
+          const p = (i - 1) >> 1;
+          if (heap[p][0] <= heap[i][0]) break;
+          [heap[p], heap[i]] = [heap[i], heap[p]]; i = p;
+        }
+      }
+      function siftDown(i) {
+        const n = heap.length;
+        for (;;) {
+          let l = 2*i + 1, r = 2*i + 2, m = i;
+          if (l < n && heap[l][0] < heap[m][0]) m = l;
+          if (r < n && heap[r][0] < heap[m][0]) m = r;
+          if (m === i) break;
+          [heap[m], heap[i]] = [heap[i], heap[m]]; i = m;
+        }
+      }
+
+      heap.length = 0; heapPush([f[sIdx], sIdx]);
+      while (heap.length) {
+        const [fv, idx] = heapPop();
+        if (closed[idx]) continue;
+        closed[idx] = 1;
+        order.push({ idx, f: fv });
+        if (idx === gIdx) break;
+        const ix = idx % NX, iz = (idx - ix) / NX;
+        for (const [dx, dz, w] of NB) {
+          const jx = ix + dx, jz = iz + dz;
+          if (jx < 0 || jx >= NX || jz < 0 || jz >= NZ) continue;
+          const jIdx = jz * NX + jx;
+          if (blocked[jIdx] || closed[jIdx]) continue;
+          // Forbid corner-cutting through obstacle cells.
+          if (dx !== 0 && dz !== 0) {
+            if (blocked[iz * NX + jx] || blocked[jz * NX + ix]) continue;
+          }
+          const ng = g[idx] + w * STEP;
+          if (ng < g[jIdx]) {
+            g[jIdx] = ng; parent[jIdx] = idx;
+            f[jIdx] = ng + Math.hypot(gx - jx, gz - jz) * STEP;
+            heapPush([f[jIdx], jIdx]);
+          }
+        }
+      }
+
+      // Reconstruct path.
+      const path = [];
+      for (let i = gIdx; i !== -1; i = parent[i]) path.push(i);
+      path.reverse();
+      return { order, path };
+    }
+
+    const aStarResult = aStar(START, GOAL);
+
+    // --- RRT* precomputation --------------------------------------------
+    function segmentClear(ax, az, bx, bz, margin = 0.3) {
+      // Sample along segment for obstacle hits. Samples every 0.15 m — finer
+      // than any obstacle dimension here. Default 0.3 m margin matches the
+      // visual half-width of the drone body so the tree doesn't graze walls.
+      const dist = Math.hypot(bx - ax, bz - az);
+      const N = Math.max(2, Math.ceil(dist / 0.15));
+      for (let i = 0; i <= N; i++) {
+        const t = i / N;
+        if (inObstacle(ax + (bx - ax) * t, az + (bz - az) * t, margin)) return false;
+      }
+      return true;
+    }
+
+    function rrtStar(start, goal, { maxIter = 700, stepLen = 1.5, rewireR = 1.8, goalThresh = 0.6 } = {}) {
+      const nodes = [{ x: start.x, z: start.z, parent: -1, cost: 0 }];
+      const events = [{ kind: 'init' }]; // [{ kind: 'add', idx, parent } | { kind: 'rewire', idx, parent }]
+      let goalIdx = -1;
+
+      for (let iter = 0; iter < maxIter; iter++) {
+        // 5% goal bias — keeps the tree drifting toward goal so it actually
+        // connects in our short timeline.
+        const bias = Math.random() < 0.06;
+        const sx = bias ? goal.x : WORLD.xMin + Math.random() * (WORLD.xMax - WORLD.xMin);
+        const sz = bias ? goal.z : WORLD.zMin + Math.random() * (WORLD.zMax - WORLD.zMin);
+        if (inObstacle(sx, sz, 0.05)) continue;
+
+        // Nearest node.
+        let nearest = -1, nd = Infinity;
+        for (let i = 0; i < nodes.length; i++) {
+          const d = Math.hypot(nodes[i].x - sx, nodes[i].z - sz);
+          if (d < nd) { nd = d; nearest = i; }
+        }
+        const n = nodes[nearest];
+        const f = Math.min(1, stepLen / nd);
+        const nx = n.x + (sx - n.x) * f;
+        const nz = n.z + (sz - n.z) * f;
+        if (!segmentClear(n.x, n.z, nx, nz)) continue;
+
+        // Choose-parent: pick lowest-cost neighbour within rewireR that has
+        // a clear segment to (nx, nz).
+        let bestParent = nearest, bestCost = n.cost + Math.hypot(nx - n.x, nz - n.z);
+        const nearbyIdx = [];
+        for (let i = 0; i < nodes.length; i++) {
+          const d = Math.hypot(nodes[i].x - nx, nodes[i].z - nz);
+          if (d <= rewireR) {
+            nearbyIdx.push(i);
+            if (segmentClear(nodes[i].x, nodes[i].z, nx, nz)) {
+              const c = nodes[i].cost + d;
+              if (c < bestCost) { bestParent = i; bestCost = c; }
+            }
+          }
+        }
+        const newIdx = nodes.length;
+        nodes.push({ x: nx, z: nz, parent: bestParent, cost: bestCost });
+        events.push({ kind: 'add', idx: newIdx, parent: bestParent });
+
+        // Rewire: see whether routing nearby through new node lowers cost.
+        for (const i of nearbyIdx) {
+          const d = Math.hypot(nodes[i].x - nx, nodes[i].z - nz);
+          const c = bestCost + d;
+          if (c < nodes[i].cost && segmentClear(nx, nz, nodes[i].x, nodes[i].z)) {
+            nodes[i].parent = newIdx;
+            nodes[i].cost = c;
+            events.push({ kind: 'rewire', idx: i, parent: newIdx });
+          }
+        }
+
+        // Goal check.
+        if (Math.hypot(nx - goal.x, nz - goal.z) < goalThresh && segmentClear(nx, nz, goal.x, goal.z)) {
+          if (goalIdx < 0) {
+            goalIdx = nodes.length;
+            const c = bestCost + Math.hypot(goal.x - nx, goal.z - nz);
+            nodes.push({ x: goal.x, z: goal.z, parent: newIdx, cost: c });
+            events.push({ kind: 'add', idx: goalIdx, parent: newIdx });
+            // keep going for a touch more rewiring polish, then stop early.
+            if (iter > maxIter * 0.4) break;
+          }
+        }
+      }
+
+      // Reconstruct goal path (parent chain).
+      const path = [];
+      if (goalIdx >= 0) {
+        for (let i = goalIdx; i !== -1; i = nodes[i].parent) path.push(i);
+        path.reverse();
+      }
+      return { nodes, events, path, goalIdx };
+    }
+
+    const rrtResult = rrtStar(START, GOAL);
+
+    // --- A* visualisation ------------------------------------------------
+    // One InstancedMesh of unit-cell tiles that we colour as cells close.
+    const cellGeo = new THREE.PlaneGeometry(STEP * 0.92, STEP * 0.92);
+    cellGeo.rotateX(-Math.PI / 2);
+    // InstancedMesh + setColorAt: Three.js auto-detects instanceColor and adds
+    // the matching shader define. Do NOT also set material.vertexColors — the
+    // material will then expect a per-vertex color attribute on the geometry
+    // and render every cell black when it doesn't find one.
+    const cellMat = new THREE.MeshBasicMaterial({ transparent: true, opacity: 0.55 });
+    const cellMesh = new THREE.InstancedMesh(cellGeo, cellMat, NX * NZ);
+    cellMesh.count = NX * NZ;
+    cellMesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+
+    const dummy = new THREE.Object3D();
+    const initColor = new THREE.Color(0x000000);
+    const HIDDEN = new THREE.Vector3(0, -10, 0);
+    for (let i = 0; i < NX * NZ; i++) {
+      dummy.position.copy(HIDDEN);
+      dummy.scale.setScalar(1);
+      dummy.updateMatrix();
+      cellMesh.setMatrixAt(i, dummy.matrix);
+      cellMesh.setColorAt(i, initColor);
+    }
+    cellMesh.instanceMatrix.needsUpdate = true;
+    cellMesh.instanceColor.needsUpdate = true;
+    cellMesh.position.y = 0.01;
+    scene.add(cellMesh);
+
+    // f-score range for colour mapping.
+    const fScores = aStarResult.order.map((o) => o.f);
+    const fMax = Math.max(...fScores);
+    const fMin = Math.min(...fScores);
+
+    // Colour ramp: low f = planning-cyan, high f = executed-magenta. Used by
+    // both algorithms' exploration colouring (RRT* uses tree-edge length as a
+    // proxy ramp).
+    const colLo = new THREE.Color(theme.colors.planning);
+    const colHi = new THREE.Color(theme.colors.executed);
+    const colTmp = new THREE.Color();
+    function rampColor(t) { return colTmp.copy(colLo).lerp(colHi, Math.max(0, Math.min(1, t))); }
+
+    function revealAStarCell(i, idx) {
+      const ix = idx % NX, iz = (idx - ix) / NX;
+      const c = cellCenter(ix, iz);
+      dummy.position.set(c.x, 0, c.z);
+      dummy.scale.setScalar(1);
+      dummy.updateMatrix();
+      cellMesh.setMatrixAt(idx, dummy.matrix);
+      const t = fMax > fMin ? (aStarResult.order[i].f - fMin) / (fMax - fMin) : 0;
+      cellMesh.setColorAt(idx, rampColor(t));
+      cellMesh.instanceMatrix.needsUpdate = true;
+      cellMesh.instanceColor.needsUpdate = true;
+    }
+
+    function hideAllCells() {
+      for (let i = 0; i < NX * NZ; i++) {
+        dummy.position.copy(HIDDEN);
+        dummy.scale.setScalar(1);
+        dummy.updateMatrix();
+        cellMesh.setMatrixAt(i, dummy.matrix);
+      }
+      cellMesh.instanceMatrix.needsUpdate = true;
+    }
+
+    // --- A* path line ----------------------------------------------------
+    const pathMat = new THREE.LineBasicMaterial({ color: theme.colors.executed, transparent: true, opacity: 0.95 });
+    const pathGeo = new THREE.BufferGeometry();
+    const pathPositions = new Float32Array(aStarResult.path.length * 3);
+    for (let i = 0; i < aStarResult.path.length; i++) {
+      const idx = aStarResult.path[i];
+      const ix = idx % NX, iz = (idx - ix) / NX;
+      const c = cellCenter(ix, iz);
+      pathPositions[i*3]   = c.x;
+      pathPositions[i*3+1] = 0.05;
+      pathPositions[i*3+2] = c.z;
+    }
+    pathGeo.setAttribute('position', new THREE.BufferAttribute(pathPositions, 3));
+    pathGeo.setDrawRange(0, 0);
+    const pathLine = new THREE.Line(pathGeo, pathMat);
+    pathLine.frustumCulled = false;
+    scene.add(pathLine);
+
+    // --- RRT* tree visualisation ----------------------------------------
+    // LineSegments grow as 'add' events fire; rewires hide the old segment
+    // and draw a new one. To keep the impl compact we maintain a parallel
+    // list of segment positions and rebuild via setDrawRange — buffer is
+    // sized once for max possible (nodes×2) edges.
+    const MAX_EDGES = rrtResult.nodes.length;
+    const treePositions = new Float32Array(MAX_EDGES * 2 * 3);
+    const treeColors    = new Float32Array(MAX_EDGES * 2 * 3);
+    const treeGeo = new THREE.BufferGeometry();
+    treeGeo.setAttribute('position', new THREE.BufferAttribute(treePositions, 3));
+    treeGeo.setAttribute('color',    new THREE.BufferAttribute(treeColors, 3));
+    const treeMat = new THREE.LineBasicMaterial({ vertexColors: true, transparent: true, opacity: 0.85 });
+    const treeLines = new THREE.LineSegments(treeGeo, treeMat);
+    treeLines.frustumCulled = false;
+    treeLines.position.y = 0.04;
+    scene.add(treeLines);
+
+    // edgeOf[node idx] = which slot (0..MAX_EDGES-1) currently owns that node's parent edge.
+    const nodeEdgeSlot = new Int32Array(rrtResult.nodes.length).fill(-1);
+    let edgeCount = 0;
+
+    function setEdge(slot, ax, az, bx, bz, color) {
+      const o = slot * 6;
+      treePositions[o + 0] = ax; treePositions[o + 1] = 0; treePositions[o + 2] = az;
+      treePositions[o + 3] = bx; treePositions[o + 4] = 0; treePositions[o + 5] = bz;
+      const co = slot * 6;
+      treeColors[co + 0] = color.r; treeColors[co + 1] = color.g; treeColors[co + 2] = color.b;
+      treeColors[co + 3] = color.r; treeColors[co + 4] = color.g; treeColors[co + 5] = color.b;
+      treeGeo.attributes.position.needsUpdate = true;
+      treeGeo.attributes.color.needsUpdate = true;
+    }
+
+    function applyRrtEvent(ev) {
+      if (ev.kind === 'add') {
+        const n = rrtResult.nodes[ev.idx], p = rrtResult.nodes[ev.parent];
+        const slot = edgeCount++;
+        nodeEdgeSlot[ev.idx] = slot;
+        // Cheap "depth" colouring: cyan core, drift toward magenta as the
+        // tree gets longer. Honest visual cue without re-running BFS.
+        const t = Math.min(1, ev.idx / MAX_EDGES);
+        setEdge(slot, p.x, p.z, n.x, n.z, rampColor(t * 0.6));
+        treeGeo.setDrawRange(0, edgeCount * 2);
+      } else if (ev.kind === 'rewire') {
+        const slot = nodeEdgeSlot[ev.idx];
+        if (slot < 0) return;
+        const n = rrtResult.nodes[ev.idx], p = rrtResult.nodes[ev.parent];
+        const t = Math.min(1, ev.idx / MAX_EDGES);
+        setEdge(slot, p.x, p.z, n.x, n.z, rampColor(t * 0.6));
+      }
+    }
+
+    function clearTree() {
+      edgeCount = 0;
+      treeGeo.setDrawRange(0, 0);
+      for (let i = 0; i < nodeEdgeSlot.length; i++) nodeEdgeSlot[i] = -1;
+    }
+
+    // RRT* path line (separate from A* path line so we can fade them in/out).
+    const rrtPathGeo = new THREE.BufferGeometry();
+    const rrtPathPositions = new Float32Array(Math.max(2, rrtResult.path.length) * 3);
+    if (rrtResult.path.length) {
+      for (let i = 0; i < rrtResult.path.length; i++) {
+        const n = rrtResult.nodes[rrtResult.path[i]];
+        rrtPathPositions[i*3]   = n.x;
+        rrtPathPositions[i*3+1] = 0.05;
+        rrtPathPositions[i*3+2] = n.z;
+      }
+    }
+    rrtPathGeo.setAttribute('position', new THREE.BufferAttribute(rrtPathPositions, 3));
+    rrtPathGeo.setDrawRange(0, 0);
+    const rrtPathMat = new THREE.LineBasicMaterial({ color: theme.colors.executed, transparent: true, opacity: 0.95 });
+    const rrtPathLine = new THREE.Line(rrtPathGeo, rrtPathMat);
+    rrtPathLine.frustumCulled = false;
+    scene.add(rrtPathLine);
+
+    // --- Drone + trail ---------------------------------------------------
+    const drone = createDrone({ scale: 0.7, accentColor: theme.colors.executed, showThrustVector: false });
+    drone.group.position.set(START.x, 0.5, START.z);
+    scene.add(drone.group);
+
+    const trail = createTrail({ maxPoints: 600, color: theme.colors.executed });
+    scene.add(trail.line);
+
+    // --- HUD -------------------------------------------------------------
+    const algoPanel = createPanel({
+      title: L.algoPanel, corner: 'tl', color: 'cyan',
+      items: [
+        { key: 'algo',  label: '', value: L.algoAStar },
+        { key: 'phase', label: '', value: L.phaseExpand },
+        { key: 'note',  label: '', value: L.noteAStar },
+      ],
+    });
+    stage.appendChild(algoPanel.el);
+
+    const statsPanel = createPanel({
+      title: L.statsPanel, corner: 'tr', color: 'magenta',
+      items: [
+        { key: 'nodes', label: L.nodes,   value: '0' },
+        { key: 'iters', label: L.iters,   value: '0' },
+        { key: 'len',   label: L.pathLen, value: '—', unit: 'm' },
+      ],
+    });
+    stage.appendChild(statsPanel.el);
+
+    // Legend (DOM, theme-aware via CSS vars; sync swatch backgrounds at load).
+    const legend = document.getElementById('legend');
+    function makeLegendRow(swatchCss, text) {
+      const row = document.createElement('div'); row.className = 'row';
+      const sw = document.createElement('span'); sw.className = 'swatch';
+      sw.style.background = swatchCss;
+      const tx = document.createElement('span'); tx.textContent = text;
+      row.appendChild(sw); row.appendChild(tx);
+      return row;
+    }
+    legend.appendChild(makeLegendRow(hexToCss(theme.colors.perception), L.legendStart));
+    legend.appendChild(makeLegendRow(hexToCss(theme.colors.executed),   L.legendGoal));
+    legend.appendChild(makeLegendRow(hexToCss(theme.colors.obstacle),   L.legendObs));
+    legend.appendChild(makeLegendRow(hexToCss(theme.colors.planning),   L.legendClosed));
+    legend.appendChild(makeLegendRow(hexToCss(theme.colors.executed),   L.legendPath));
+
+    // --- Path geometry helpers for "fly" phase --------------------------
+    // Build a smooth Catmull-Rom curve through the path waypoints so the
+    // drone's flight reads as a plan, not a grid lurch.
+    function curveFromIndices(points) {
+      const v = points.map(({ x, z }) => new THREE.Vector3(x, 0.6, z));
+      return new THREE.CatmullRomCurve3(v, false, 'catmullrom', 0.4);
+    }
+    const aStarPathPoints = aStarResult.path.map((idx) => {
+      const ix = idx % NX, iz = (idx - ix) / NX;
+      return cellCenter(ix, iz);
+    });
+    const rrtPathPoints = rrtResult.path.map((i) => {
+      const n = rrtResult.nodes[i]; return { x: n.x, z: n.z };
+    });
+    const aStarCurve = curveFromIndices(aStarPathPoints);
+    const rrtCurve   = rrtPathPoints.length ? curveFromIndices(rrtPathPoints) : aStarCurve;
+
+    function pathLengthMeters(pts) {
+      let L = 0;
+      for (let i = 1; i < pts.length; i++) L += Math.hypot(pts[i].x - pts[i-1].x, pts[i].z - pts[i-1].z);
+      return L;
+    }
+    const aStarLen = pathLengthMeters(aStarPathPoints);
+    const rrtLen   = pathLengthMeters(rrtPathPoints);
+
+    // --- Phase machine ---------------------------------------------------
+    // Timeline (seconds, looping):
+    //   0 .. 6      A* expand
+    //   6 .. 6.6    A* path reveal (line draws in)
+    //   6.6 .. 11.6 A* drone flies path
+    //   11.6 .. 12  fade A* layer out
+    //   12 .. 18    RRT* expand
+    //   18 .. 18.6  RRT* path reveal
+    //   18.6 .. 23.6 RRT* drone flies path
+    //   23.6 .. 24  fade RRT* layer out + reset
+    const T = {
+      aExpEnd: 6, aRevEnd: 6.6, aFlyEnd: 11.6, aFadeEnd: 12,
+      rExpEnd: 18, rRevEnd: 18.6, rFlyEnd: 23.6, rFadeEnd: 24,
+    };
+    const LOOP = T.rFadeEnd;
+
+    let lastPhase = '';
+    let phaseT0 = 0;
+
+    function setPhase(name, algo) {
+      if (name === lastPhase) return;
+      lastPhase = name;
+      algoPanel.setValue('algo', algo === 'astar' ? L.algoAStar : L.algoRRT);
+      algoPanel.setValue('note', algo === 'astar' ? L.noteAStar : L.noteRRT);
+      const phaseLbl = name === 'expand' ? L.phaseExpand
+                     : name === 'reveal' ? L.phaseReveal
+                     : L.phaseFly;
+      algoPanel.setValue('phase', phaseLbl);
+      phaseT0 = performance.now() * 0.001;
+    }
+
+    // --- Loop ------------------------------------------------------------
+    // Counters that survive across frames within an algorithm phase.
+    let lastAStarShown = 0;
+    let lastRrtShown = 0;
+
+    const clock = new THREE.Clock();
+    let loopT0 = performance.now() * 0.001;
+
+    (function tick() {
+      const now = performance.now() * 0.001;
+      let t = (now - loopT0) % LOOP;
+      const dt = Math.min(0.05, clock.getDelta());
+
+      // --- A* expansion replay ---------------------------------------
+      if (t < T.aExpEnd) {
+        setPhase('expand', 'astar');
+        const u = t / T.aExpEnd; // 0..1
+        const target = Math.floor(u * aStarResult.order.length);
+        // Reveal cells up to target. Lazy: track a counter, replay forward
+        // when t advances; rewind by full reset when wrapping around.
+        if (target < lastAStarShown) hideAllCells(), (lastAStarShown = 0);
+        for (let i = lastAStarShown; i < target; i++) revealAStarCell(i, aStarResult.order[i].idx);
+        lastAStarShown = target;
+        statsPanel.setValue('nodes', target);
+        statsPanel.setValue('iters', target);
+        statsPanel.setValue('len', '—');
+        pathGeo.setDrawRange(0, 0);
+        drone.group.position.set(START.x, 0.5, START.z);
+        cellMat.opacity = 0.55;
+        pathLine.material.opacity = 0;
+        treeLines.visible = false;
+        rrtPathLine.material.opacity = 0;
+      }
+      // --- A* path reveal --------------------------------------------
+      else if (t < T.aRevEnd) {
+        setPhase('reveal', 'astar');
+        const u = (t - T.aExpEnd) / (T.aRevEnd - T.aExpEnd);
+        if (lastAStarShown < aStarResult.order.length) {
+          for (let i = lastAStarShown; i < aStarResult.order.length; i++)
+            revealAStarCell(i, aStarResult.order[i].idx);
+          lastAStarShown = aStarResult.order.length;
+        }
+        pathLine.material.opacity = 0.95;
+        const drawN = Math.floor(u * aStarResult.path.length);
+        pathGeo.setDrawRange(0, Math.max(2, drawN));
+        statsPanel.setValue('len', aStarLen.toFixed(1));
+      }
+      // --- A* fly ----------------------------------------------------
+      else if (t < T.aFlyEnd) {
+        setPhase('fly', 'astar');
+        pathGeo.setDrawRange(0, aStarResult.path.length);
+        const u = (t - T.aRevEnd) / (T.aFlyEnd - T.aRevEnd);
+        const p = aStarCurve.getPoint(Math.min(0.999, u));
+        drone.group.position.copy(p);
+        // yaw with tangent
+        const tan = aStarCurve.getTangent(Math.min(0.999, u));
+        drone.group.rotation.y = Math.atan2(tan.x, tan.z);
+        drone.update(dt);
+        if (u > 0 && u < 1) trail.push(p);
+      }
+      // --- A* fade ---------------------------------------------------
+      else if (t < T.aFadeEnd) {
+        const u = (t - T.aFlyEnd) / (T.aFadeEnd - T.aFlyEnd);
+        cellMat.opacity = 0.55 * (1 - u);
+        pathLine.material.opacity = 0.95 * (1 - u);
+        if (u > 0.95) { trail.clear(); }
+      }
+      // --- RRT* expansion --------------------------------------------
+      else if (t < T.rExpEnd) {
+        setPhase('expand', 'rrt');
+        if (treeLines.visible === false) {
+          // First entry into RRT phase: hide A* layers.
+          hideAllCells(); lastAStarShown = 0;
+          pathGeo.setDrawRange(0, 0);
+          cellMat.opacity = 0.55;
+          pathLine.material.opacity = 0;
+          treeLines.visible = true;
+          drone.group.position.set(START.x, 0.5, START.z);
+        }
+        const u = (t - T.aFadeEnd) / (T.rExpEnd - T.aFadeEnd);
+        const target = Math.floor(u * rrtResult.events.length);
+        if (target < lastRrtShown) clearTree(), (lastRrtShown = 0);
+        for (let i = lastRrtShown; i < target; i++) applyRrtEvent(rrtResult.events[i]);
+        lastRrtShown = target;
+        statsPanel.setValue('iters', target);
+        statsPanel.setValue('nodes', edgeCount);
+        statsPanel.setValue('len', '—');
+        rrtPathGeo.setDrawRange(0, 0);
+        rrtPathLine.material.opacity = 0;
+      }
+      // --- RRT* path reveal ------------------------------------------
+      else if (t < T.rRevEnd) {
+        setPhase('reveal', 'rrt');
+        if (lastRrtShown < rrtResult.events.length) {
+          for (let i = lastRrtShown; i < rrtResult.events.length; i++)
+            applyRrtEvent(rrtResult.events[i]);
+          lastRrtShown = rrtResult.events.length;
+        }
+        const u = (t - T.rExpEnd) / (T.rRevEnd - T.rExpEnd);
+        rrtPathLine.material.opacity = 0.95;
+        const drawN = Math.floor(u * rrtResult.path.length);
+        rrtPathGeo.setDrawRange(0, Math.max(2, drawN));
+        statsPanel.setValue('len', rrtLen.toFixed(1));
+      }
+      // --- RRT* fly --------------------------------------------------
+      else if (t < T.rFlyEnd) {
+        setPhase('fly', 'rrt');
+        rrtPathGeo.setDrawRange(0, rrtResult.path.length);
+        const u = (t - T.rRevEnd) / (T.rFlyEnd - T.rRevEnd);
+        const p = rrtCurve.getPoint(Math.min(0.999, u));
+        drone.group.position.copy(p);
+        const tan = rrtCurve.getTangent(Math.min(0.999, u));
+        drone.group.rotation.y = Math.atan2(tan.x, tan.z);
+        drone.update(dt);
+        if (u > 0 && u < 1) trail.push(p);
+      }
+      // --- RRT* fade -> reset for next loop --------------------------
+      else {
+        const u = (t - T.rFlyEnd) / (T.rFadeEnd - T.rFlyEnd);
+        treeMat.opacity = 0.85 * (1 - u);
+        rrtPathLine.material.opacity = 0.95 * (1 - u);
+        if (u > 0.95) {
+          // Reset RRT layers; A* state was already reset on its fade.
+          clearTree(); lastRrtShown = 0;
+          treeMat.opacity = 0.85;
+          rrtPathGeo.setDrawRange(0, 0);
+          treeLines.visible = false;
+          trail.clear();
+          drone.group.position.set(START.x, 0.5, START.z);
+        }
+      }
+
+      renderer.render(scene, camera);
+      requestAnimationFrame(tick);
+    })();
+
+    // --- Resize + dispose ------------------------------------------------
+    addEventListener('resize', () => {
+      camera.aspect = stage.clientWidth / stage.clientHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(stage.clientWidth, stage.clientHeight);
+    });
+    addEventListener('beforeunload', () => {
+      drone.dispose(); trail.dispose();
+      cellGeo.dispose(); cellMat.dispose();
+      pathGeo.dispose(); pathMat.dispose();
+      treeGeo.dispose(); treeMat.dispose();
+      rrtPathGeo.dispose(); rrtPathMat.dispose();
+      startGeo.dispose(); goalGeo.dispose();
+      startMat.dispose(); goalMat.dispose();
+      obsMat.dispose();
+      for (const o of obsGroup.children) o.userData.dispose?.();
+      algoPanel.dispose(); statsPanel.dispose();
+      disposeEnv(); renderer.dispose();
+    });
+  </script>
+</body>
+</html>
