@@ -1,0 +1,533 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Ch6 · 占据栅格 / ESDF</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+SC:wght@300;400;500;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/src/kit/hud.css">
+  <style>
+    /* Occupancy grid + ESDF. The drone sweeps a serpentine pattern at fixed
+     * altitude over an obstacle field; a horizontal LIDAR fan rasterises every
+     * traversed ray into a 2-D voxel grid (free cells along the ray, occupied
+     * cell at the hit). Halfway through the loop the view flips from
+     * "occupancy" (binary green/magenta) to "ESDF" — every observed free
+     * voxel is recoloured by its precomputed Euclidean distance to the
+     * nearest occupied voxel. The ESDF is computed once on load over the
+     * static obstacle map, not in real time. */
+
+    html, body { margin: 0; background: var(--stage-bg); color: var(--label-strong-fg);
+                 font-family: "Noto Sans SC", sans-serif; overflow: hidden; }
+
+    #note {
+      position: absolute; top: 24px; left: 50%; transform: translateX(-50%);
+      font-family: "JetBrains Mono", monospace;
+      font-size: 11px;
+      color: var(--label-fg);
+      background: var(--label-bg);
+      border: 0.5px solid var(--label-border);
+      border-radius: 3px;
+      padding: 5px 12px;
+      pointer-events: none;
+    }
+    #legend {
+      position: absolute; bottom: 16px; left: 16px;
+      font-family: "JetBrains Mono", monospace;
+      font-size: 11px;
+      color: var(--label-fg);
+      background: var(--label-bg);
+      border: 0.5px solid var(--label-border);
+      border-radius: 6px;
+      padding: 8px 12px;
+      pointer-events: none;
+      letter-spacing: 0.02em;
+      line-height: 1.7;
+    }
+    #legend .row { display: flex; align-items: center; gap: 8px; }
+    #legend .swatch {
+      display: inline-block; width: 14px; height: 10px; border-radius: 2px;
+      border: 0.5px solid var(--label-border);
+    }
+    #legend .grad {
+      display: inline-block; width: 60px; height: 10px; border-radius: 2px;
+      border: 0.5px solid var(--label-border);
+      background: linear-gradient(90deg, #ff334f 0%, #ffb454 35%, #5dd3ff 70%, #5169ff 100%);
+    }
+    #hint {
+      position: absolute; bottom: 16px; right: 56px;
+      font-family: "JetBrains Mono", monospace;
+      font-size: 10px;
+      color: var(--hud-unit);
+      pointer-events: none;
+    }
+  </style>
+</head>
+<body>
+  <div id="stage" style="position:relative;width:100vw;height:100vh"></div>
+  <div id="note"></div>
+  <div id="legend"></div>
+  <div id="hint"></div>
+
+  <script type="module">
+    import * as THREE from 'three';
+    import { createEnvironment } from '/src/kit/Environment.js';
+    import { createDrone }       from '/src/kit/Quadrotor.js';
+    import { createTrail }       from '/src/kit/Trajectory.js';
+    import { createPanel }       from '/src/kit/Hud.js';
+    import { labels }            from '/src/kit/labels.js';
+    import { theme, mountThemeToggle, hexToCss } from '/src/kit/theme.js';
+
+    const L = labels.ch06.occupancy;
+    document.getElementById('note').textContent = L.note;
+    document.getElementById('hint').textContent = L.hint;
+
+    // --- Grid & obstacles ---------------------------------------------------
+    // 2-D voxel grid at fixed altitude (single horizontal slice). Each cell
+    // is 0.5×0.4×0.5 m and the grid covers a 16×16 m workspace centred on
+    // origin. ESDF is computed in 2-D — the LIDAR fan sweeps the slice, so
+    // that's exactly what the audience sees being mapped.
+    const GRID_NX = 32;
+    const GRID_NZ = 32;
+    const VOXEL_X = 0.5;
+    const VOXEL_Z = 0.5;
+    const VOXEL_Y = 0.4;
+    const SLICE_Y = 1.2;
+    const HALF_X  = GRID_NX * VOXEL_X / 2;
+    const HALF_Z  = GRID_NZ * VOXEL_Z / 2;
+    const N_CELLS = GRID_NX * GRID_NZ;
+
+    const cellIndex = (ix, iz) => ix * GRID_NZ + iz;
+    function worldToCell(x, z) {
+      const ix = Math.floor((x + HALF_X) / VOXEL_X);
+      const iz = Math.floor((z + HALF_Z) / VOXEL_Z);
+      if (ix < 0 || ix >= GRID_NX || iz < 0 || iz >= GRID_NZ) return -1;
+      return cellIndex(ix, iz);
+    }
+    function cellCenter(idx) {
+      const ix = Math.floor(idx / GRID_NZ);
+      const iz = idx % GRID_NZ;
+      return {
+        x: (ix + 0.5) * VOXEL_X - HALF_X,
+        z: (iz + 0.5) * VOXEL_Z - HALF_Z,
+      };
+    }
+
+    // Six box obstacles laid out around the workspace. Heights vary so the
+    // external camera sees a small skyline; the LIDAR fan is at SLICE_Y so
+    // only the in-slice xz footprint matters for the grid.
+    const OBSTACLES = [
+      { x0: -6.5, x1: -4.5, y0: 0.0, y1: 2.6, z0: -1.5, z1:  3.0 },
+      { x0: -2.6, x1: -1.4, y0: 0.0, y1: 1.8, z0: -5.5, z1: -3.5 },
+      { x0:  0.5, x1:  3.0, y0: 0.0, y1: 2.2, z0:  1.0, z1:  2.5 },
+      { x0:  3.4, x1:  5.0, y0: 0.0, y1: 1.6, z0: -2.4, z1: -0.6 },
+      { x0: -1.0, x1:  0.5, y0: 0.0, y1: 1.4, z0: -2.0, z1: -1.0 },
+      { x0:  4.0, x1:  6.6, y0: 0.0, y1: 2.0, z0:  3.5, z1:  5.5 },
+    ];
+
+    // Static occupancy from the obstacle list. A cell is occupied if its
+    // centre falls inside any obstacle's xz AABB AND the obstacle reaches
+    // the slice altitude (it always does for our obstacles, but check).
+    const occupied = new Uint8Array(N_CELLS);
+    for (let ix = 0; ix < GRID_NX; ix++) {
+      const cx = (ix + 0.5) * VOXEL_X - HALF_X;
+      for (let iz = 0; iz < GRID_NZ; iz++) {
+        const cz = (iz + 0.5) * VOXEL_Z - HALF_Z;
+        for (const o of OBSTACLES) {
+          if (cx >= o.x0 && cx <= o.x1 && cz >= o.z0 && cz <= o.z1
+              && SLICE_Y >= o.y0 && SLICE_Y <= o.y1) {
+            occupied[cellIndex(ix, iz)] = 1;
+            break;
+          }
+        }
+      }
+    }
+
+    // ESDF: distance from each cell to the nearest occupied cell. Brute force
+    // is fine — we only loop free × occupied cells (≈ 1000 × 30 = 30 k).
+    const esdf = new Float32Array(N_CELLS);
+    const occList = [];
+    for (let i = 0; i < N_CELLS; i++) if (occupied[i]) occList.push(i);
+    for (let i = 0; i < N_CELLS; i++) {
+      if (occupied[i]) { esdf[i] = 0; continue; }
+      const c = cellCenter(i);
+      let minD = Infinity;
+      for (const j of occList) {
+        const o = cellCenter(j);
+        const dx = c.x - o.x, dz = c.z - o.z;
+        const d = Math.sqrt(dx*dx + dz*dz);
+        if (d < minD) minD = d;
+      }
+      esdf[i] = minD === Infinity ? 99 : minD;
+    }
+
+    // --- Scene --------------------------------------------------------------
+    const stage = document.getElementById('stage');
+    const { scene, addLights, dispose: disposeEnv } = createEnvironment({
+      grid: true, fog: true, floor: true, sceneSize: 30, logoClouds: false,
+    });
+    addLights();
+    mountThemeToggle();
+
+    const camera = new THREE.PerspectiveCamera(48, stage.clientWidth / stage.clientHeight, 0.1, 80);
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+    renderer.setSize(stage.clientWidth, stage.clientHeight);
+    stage.appendChild(renderer.domElement);
+
+    // Obstacle meshes (used as raycast targets AND as the visible "scene
+    // furniture" for the external camera).
+    const obsMat = new THREE.MeshStandardMaterial({
+      color: theme.colors.obstacle, metalness: 0.05, roughness: 0.95,
+    });
+    const obsMeshes = [];
+    const obstacleObjects = [];
+    for (const o of OBSTACLES) {
+      const w = o.x1 - o.x0, h = o.y1 - o.y0, d = o.z1 - o.z0;
+      const geo = new THREE.BoxGeometry(w, h, d);
+      const mesh = new THREE.Mesh(geo, obsMat);
+      mesh.position.set((o.x0+o.x1)/2, (o.y0+o.y1)/2, (o.z0+o.z1)/2);
+      scene.add(mesh);
+      obsMeshes.push({ mesh, geo });
+      obstacleObjects.push(mesh);
+    }
+
+    // Drone + trail.
+    const drone = createDrone({ scale: 0.85, accentColor: theme.colors.executed });
+    drone.group.position.set(-7, SLICE_Y, -6);
+    scene.add(drone.group);
+    const trail = createTrail({ maxPoints: 600, color: theme.colors.executed });
+    scene.add(trail.line);
+
+    // --- LIDAR fan ----------------------------------------------------------
+    // Rolled-by-hand because we need per-ray (origin, end, didHit) and the kit
+    // helper exposes only an aggregate hit count. Same Float32 buffer pattern
+    // (LineSegments + position attribute, updated in place) so it stays cheap.
+    const NUM_RAYS = 72;
+    const RANGE = 8;
+    const fanPositions = new Float32Array(NUM_RAYS * 2 * 3);
+    const fanGeo = new THREE.BufferGeometry();
+    fanGeo.setAttribute('position', new THREE.BufferAttribute(fanPositions, 3));
+    const fanMat = new THREE.LineBasicMaterial({
+      color: theme.colors.perception, transparent: true, opacity: 0.32,
+    });
+    const fan = new THREE.LineSegments(fanGeo, fanMat);
+    fan.frustumCulled = false;
+    scene.add(fan);
+
+    const raycaster = new THREE.Raycaster();
+    raycaster.far = RANGE;
+    const tmpDir = new THREE.Vector3();
+    const tmpOrigin = new THREE.Vector3();
+
+    // --- Voxel instances ----------------------------------------------------
+    // observed[idx]: 0 unobserved, 1 free observed, 2 occupied observed.
+    const observed = new Uint8Array(N_CELLS);
+    const cellSlot = new Int32Array(N_CELLS).fill(-1);
+    let activeCount = 0;
+
+    const voxelGeo = new THREE.BoxGeometry(VOXEL_X * 0.92, VOXEL_Y * 0.6, VOXEL_Z * 0.92);
+    const voxelMat = new THREE.MeshBasicMaterial({
+      transparent: true, opacity: 0.42, depthWrite: false,
+    });
+    const voxelMesh = new THREE.InstancedMesh(voxelGeo, voxelMat, N_CELLS);
+    voxelMesh.count = 0;
+    voxelMesh.instanceColor = new THREE.InstancedBufferAttribute(
+      new Float32Array(N_CELLS * 3), 3,
+    );
+    scene.add(voxelMesh);
+
+    const dummyM = new THREE.Matrix4();
+    const dummyC = new THREE.Color();
+
+    // Two render modes: 'occ' colours by occupancy class (free vs hit);
+    // 'esdf' colours by precomputed distance-to-nearest-obstacle.
+    let mode = 'occ';
+
+    // ESDF colour ramp keyed in metres of clearance. Designed to read
+    // monotonically from "danger" red through a warm midband into cool blues
+    // for safe space. Stops were picked so the most common ESDF values in
+    // this scene (0.3–2.0 m) all land inside a perceptually distinct band.
+    const ESDF_STOPS = [
+      { d: 0.0, r: 1.00, g: 0.20, b: 0.31 },   // red
+      { d: 0.5, r: 1.00, g: 0.71, b: 0.33 },   // amber
+      { d: 1.5, r: 0.36, g: 0.83, b: 1.00 },   // cyan
+      { d: 2.5, r: 0.32, g: 0.41, b: 1.00 },   // blue
+    ];
+    function esdfColor(d, out) {
+      for (let i = 0; i < ESDF_STOPS.length - 1; i++) {
+        const a = ESDF_STOPS[i], b = ESDF_STOPS[i+1];
+        if (d <= b.d) {
+          const t = (d - a.d) / (b.d - a.d);
+          out.r = a.r + (b.r - a.r) * t;
+          out.g = a.g + (b.g - a.g) * t;
+          out.b = a.b + (b.b - a.b) * t;
+          return;
+        }
+      }
+      const last = ESDF_STOPS[ESDF_STOPS.length - 1];
+      out.r = last.r; out.g = last.g; out.b = last.b;
+    }
+
+    function setCellColor(idx, slot) {
+      if (mode === 'occ') {
+        if (observed[idx] === 2) dummyC.setHex(theme.colors.executed);
+        else                     dummyC.setHex(theme.colors.perception);
+      } else {
+        if (observed[idx] === 2) {
+          dummyC.setRGB(1.0, 0.20, 0.31);  // hits stay red — they ARE the obstacle
+        } else {
+          esdfColor(esdf[idx], dummyC);
+        }
+      }
+      voxelMesh.setColorAt(slot, dummyC);
+    }
+
+    function markCell(idx, type) {
+      if (observed[idx] === 0) {
+        observed[idx] = type;
+        const c = cellCenter(idx);
+        cellSlot[idx] = activeCount;
+        dummyM.makeTranslation(c.x, SLICE_Y, c.z);
+        voxelMesh.setMatrixAt(activeCount, dummyM);
+        setCellColor(idx, activeCount);
+        activeCount++;
+        voxelMesh.count = activeCount;
+        voxelMesh.instanceMatrix.needsUpdate = true;
+        voxelMesh.instanceColor.needsUpdate = true;
+      } else if (type > observed[idx]) {
+        // Free cell upgraded to occupied — same instance slot, recolour.
+        observed[idx] = type;
+        setCellColor(idx, cellSlot[idx]);
+        voxelMesh.instanceColor.needsUpdate = true;
+      }
+    }
+
+    function recolorAll() {
+      for (let i = 0; i < N_CELLS; i++) {
+        if (observed[i] && cellSlot[i] >= 0) setCellColor(i, cellSlot[i]);
+      }
+      voxelMesh.instanceColor.needsUpdate = true;
+    }
+
+    function clearVoxels() {
+      observed.fill(0);
+      cellSlot.fill(-1);
+      activeCount = 0;
+      voxelMesh.count = 0;
+    }
+
+    // --- LIDAR rasterisation ------------------------------------------------
+    // For each ray: cast against obstacles, then walk from origin to endpoint
+    // in fixed steps marking each cell as free; the endpoint cell becomes
+    // occupied if the ray actually hit something. Step is half a voxel so
+    // every cell along the path is visited at least once.
+    const STEP = VOXEL_X * 0.5;
+
+    function castFan(origin) {
+      let hits = 0;
+      for (let i = 0; i < NUM_RAYS; i++) {
+        const a = (i / NUM_RAYS) * Math.PI * 2;
+        tmpDir.set(Math.cos(a), 0, Math.sin(a));
+        tmpOrigin.copy(origin);
+        raycaster.set(tmpOrigin, tmpDir);
+        const its = raycaster.intersectObjects(obstacleObjects, false);
+        const hit = its[0];
+        const dist = hit ? hit.distance : RANGE;
+        if (hit) hits++;
+
+        const ex = origin.x + tmpDir.x * dist;
+        const ez = origin.z + tmpDir.z * dist;
+        const base = i * 6;
+        fanPositions[base]     = origin.x;
+        fanPositions[base + 1] = origin.y;
+        fanPositions[base + 2] = origin.z;
+        fanPositions[base + 3] = ex;
+        fanPositions[base + 4] = origin.y;
+        fanPositions[base + 5] = ez;
+
+        // Walk ray, marking cells along the way.
+        const N = Math.max(1, Math.ceil(dist / STEP));
+        for (let k = 1; k <= N; k++) {
+          const t = k / N;
+          const x = origin.x + tmpDir.x * dist * t;
+          const z = origin.z + tmpDir.z * dist * t;
+          const idx = worldToCell(x, z);
+          if (idx < 0) continue;
+          const isEnd = (k === N) && hit;
+          markCell(idx, isEnd ? 2 : 1);
+        }
+      }
+      fanGeo.attributes.position.needsUpdate = true;
+      return hits;
+    }
+
+    // --- Sweep path ---------------------------------------------------------
+    // Serpentine across four z-strips. The drone goes back and forth while
+    // the obstacles get rasterised from every angle. Speed is tuned so the
+    // grid is ~70 % full by the ESDF flip and ~95 % full by loop end.
+    const STRIPS = [-6, -2, 2, 6];
+    const X_MIN = -7.5, X_MAX = 7.5;
+    function dronePosAt(t) {
+      // t in [0, 1) over the sweep portion of the loop.
+      const u = t * STRIPS.length;
+      let strip = Math.floor(u);
+      if (strip >= STRIPS.length) strip = STRIPS.length - 1;
+      const su = u - strip;
+      const z = STRIPS[strip];
+      const goingRight = strip % 2 === 0;
+      const x = goingRight ? X_MIN + su * (X_MAX - X_MIN)
+                           : X_MAX - su * (X_MAX - X_MIN);
+      return { x, y: SLICE_Y, z };
+    }
+
+    // --- HUD ----------------------------------------------------------------
+    const modePanel = createPanel({
+      title: L.modePanel, corner: 'tl', color: 'cyan',
+      items: [
+        { key: 'mode', label: '', value: L.modeOcc },
+      ],
+    });
+    stage.appendChild(modePanel.el);
+
+    const statsPanel = createPanel({
+      title: L.statsPanel, corner: 'tr', color: 'magenta',
+      items: [
+        { key: 'count', label: L.voxelCount, value: '0' },
+        { key: 'clear', label: L.minClear,   value: '—', unit: 'm' },
+        { key: 'size',  label: L.voxelSize,  value: VOXEL_X.toFixed(2), unit: 'm' },
+        { key: 'grid',  label: L.gridSize,   value: `${GRID_NX} × ${GRID_NZ}` },
+      ],
+    });
+    stage.appendChild(statsPanel.el);
+
+    // Legend.
+    const legend = document.getElementById('legend');
+    function rowSwatch(css, text) {
+      const row = document.createElement('div'); row.className = 'row';
+      const sw = document.createElement('span'); sw.className = 'swatch';
+      sw.style.background = css;
+      const tx = document.createElement('span'); tx.textContent = text;
+      row.appendChild(sw); row.appendChild(tx); return row;
+    }
+    function rowGrad(text) {
+      const row = document.createElement('div'); row.className = 'row';
+      const sw = document.createElement('span'); sw.className = 'grad';
+      const tx = document.createElement('span'); tx.textContent = text;
+      row.appendChild(sw); row.appendChild(tx); return row;
+    }
+    legend.appendChild(rowSwatch(hexToCss(theme.colors.executed),   L.legendOcc));
+    legend.appendChild(rowGrad('ESDF · 0 m → >2.5 m'));
+
+    // --- Loop ---------------------------------------------------------------
+    // 0..14 s   : occupancy mode, drone sweeps building the grid
+    // 14 s     : flip to ESDF (single recolor pass)
+    // 14..28 s  : ESDF mode, drone keeps sweeping; new cells colored by ESDF
+    // 28..30 s : reset (clear voxels, drone repositions)
+    const T_OCC_END  = 14;
+    const T_ESDF_END = 28;
+    const T_LOOP     = 30;
+    let loopStart = performance.now() * 0.001;
+
+    const dronePos = new THREE.Vector3();
+    const followPos = new THREE.Vector3();
+    let trailLastT = -1;
+
+    const clock = new THREE.Clock();
+    (function tick() {
+      const dt = Math.min(0.05, clock.getDelta());
+      const now = performance.now() * 0.001;
+      const t = (now - loopStart) % T_LOOP;
+
+      let phase, sweepU;
+      if (t < T_OCC_END) {
+        phase = 'occ';
+        sweepU = t / T_OCC_END;
+      } else if (t < T_ESDF_END) {
+        phase = 'esdf';
+        sweepU = (t - T_OCC_END) / (T_ESDF_END - T_OCC_END);
+      } else {
+        phase = 'reset';
+      }
+
+      if (phase === 'occ' && mode !== 'occ') {
+        mode = 'occ';
+        recolorAll();
+        modePanel.setValue('mode', L.modeOcc);
+      } else if (phase === 'esdf' && mode !== 'esdf') {
+        mode = 'esdf';
+        recolorAll();
+        modePanel.setValue('mode', L.modeESDF);
+      }
+
+      if (phase === 'reset') {
+        // Single-shot reset on entry to phase. Use a sentinel so we don't
+        // clear repeatedly across frames.
+        if (mode !== 'occ' || activeCount > 0) {
+          clearVoxels();
+          mode = 'occ';
+          modePanel.setValue('mode', L.modeOcc);
+          trail.clear();
+        }
+        // Park the drone near the start of the next sweep.
+        dronePos.set(X_MIN, SLICE_Y, STRIPS[0]);
+      } else {
+        const p = dronePosAt(sweepU);
+        dronePos.set(p.x, p.y, p.z);
+        // Yaw toward direction of motion so the visible body matches the path.
+        const eps = 0.001;
+        const ahead = dronePosAt(Math.min(0.999, sweepU + eps));
+        const dx = ahead.x - p.x, dz = ahead.z - p.z;
+        if (Math.hypot(dx, dz) > 1e-4) drone.group.rotation.y = Math.atan2(dx, dz);
+        // Cast at ~30 Hz inside the render loop. The simulator runs at the
+        // browser's frame rate, but rasterising at 60 fps over many rays
+        // shows up on the JS thread without much extra coverage — half-rate
+        // sampling keeps things crisp.
+        const castEvery = 2;
+        if (Math.floor(now * 60) % castEvery === 0) castFan(dronePos);
+        // Trail.
+        if (sweepU - trailLastT > 0.002) { trail.push(dronePos); trailLastT = sweepU; }
+      }
+
+      drone.group.position.copy(dronePos);
+      drone.update(dt);
+
+      // HUD updates: voxel count + current ESDF clearance at the drone cell.
+      statsPanel.setValue('count', String(activeCount));
+      const dIdx = worldToCell(dronePos.x, dronePos.z);
+      if (dIdx >= 0 && observed[dIdx]) {
+        const c = esdf[dIdx];
+        statsPanel.setValue('clear', c.toFixed(2));
+      }
+
+      // Camera: oblique loose-follow. Smooth drift so the obstacle field
+      // stays the centre of attention.
+      const a = now * 0.06;
+      const r = 16, h = 11;
+      followPos.set(Math.cos(a) * r, h, Math.sin(a) * r);
+      camera.position.lerp(followPos, 0.06);
+      camera.lookAt(0, 1.2, 0);
+
+      renderer.render(scene, camera);
+      requestAnimationFrame(tick);
+    })();
+
+    // --- Resize + dispose ---------------------------------------------------
+    addEventListener('resize', () => {
+      camera.aspect = stage.clientWidth / stage.clientHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(stage.clientWidth, stage.clientHeight);
+    });
+    addEventListener('beforeunload', () => {
+      drone.dispose(); trail.dispose();
+      for (const o of obsMeshes) o.geo.dispose();
+      obsMat.dispose();
+      voxelGeo.dispose(); voxelMat.dispose();
+      fanGeo.dispose(); fanMat.dispose();
+      modePanel.dispose(); statsPanel.dispose();
+      disposeEnv(); renderer.dispose();
+    });
+  </script>
+</body>
+</html>

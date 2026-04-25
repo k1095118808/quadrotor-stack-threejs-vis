@@ -320,6 +320,76 @@ export const labels = {
       note:          '将非凸避障松弛为凸约束',
     },
   },
+  ch06: {
+    occupancyTitle: '占据栅格 / ESDF',
+    orbTitle:       'ORB 特征匹配',
+    yoloTitle:      'YOLO 目标检测',
+    occupancy: {
+      // P0-11. Drone flies a sweep over an obstacle field; LIDAR rays carve
+      // voxels into an occupancy grid; mid-loop the view flips to a
+      // pre-computed ESDF that recolors every voxel by distance to the
+      // nearest occupied cell.
+      modePanel:    '模式',
+      statsPanel:   '体素统计',
+      modeOcc:      '占据栅格',
+      modeESDF:     'ESDF · 距障碍距离',
+      voxelCount:   '体素数',
+      minClear:     '最小间隙',
+      voxelSize:    '体素尺寸',
+      gridSize:     '栅格尺寸',
+      legendOcc:    '已占据',
+      legendNear:   'ESDF · 近 (≤0.5 m)',
+      legendMid:    'ESDF · 中 (0.5–1.5 m)',
+      legendFar:    'ESDF · 远 (>1.5 m)',
+      note:         '激光命中 → 占据栅格 · ESDF 距离场便于规划与避障',
+      hint:         '30 s 循环 · 半程切换 ESDF',
+    },
+    orb: {
+      // P0-12. Two side-by-side panels show a synthetic scene from slightly
+      // different viewpoints. ORB-like keypoints appear on each, then matches
+      // draw between them — a few obvious outliers in red fade away when
+      // RANSAC fires, leaving inliers in green.
+      panelLeft:    '图像 A',
+      panelRight:   '图像 B',
+      statsPanel:   '匹配统计',
+      stagePanel:   '阶段',
+      stageDetect:  '关键点检测',
+      stageMatch:   '描述子匹配',
+      stageRansac:  'RANSAC 剔除外点',
+      stageHold:    '内点保留',
+      total:        '总匹配',
+      inliers:      '内点',
+      outliers:     '外点',
+      method:       '剔除方法',
+      sceneLabel:   '场景',
+      legendKp:     '关键点',
+      legendInlier: '内点匹配',
+      legendOutlier:'外点 · 待剔除',
+      note:         '稀疏特征 · 描述子距离 + RANSAC 单应矩阵',
+      hint:         '4 组场景 · 每组 10 s · 自动循环',
+    },
+    yolo: {
+      // P1. Drone camera pans over a synthetic city block; 2D bounding boxes
+      // appear on top of detected objects with class label + confidence.
+      // Confidence flickers, low-confidence boxes appear faint, occasional
+      // misses — to teach detection is per-frame and not always confident.
+      feedTag:      '机载相机 · 50 Hz',
+      modelTag:     '检测器 · YOLO-style',
+      detectPanel:  '当前检测',
+      statsPanel:   '统计',
+      countLabel:   '检测目标',
+      avgConf:      '平均置信度',
+      threshold:    '置信度阈值',
+      legendCar:    '车辆',
+      legendPerson: '行人',
+      legendSign:   '路牌',
+      classCar:     '车辆',
+      classPerson:  '行人',
+      classSign:    '路牌',
+      note:         '逐帧检测 · 边界框 + 类别 + 置信度',
+      hint:         '20 s 循环 · 置信度阈值 0.45',
+    },
+  },
   demo: {
     // Strings used only by src/kit-demo.html (Phase 0 acceptance test).
     title:     '工具包演示',
