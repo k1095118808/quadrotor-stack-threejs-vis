@@ -1,0 +1,515 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Ch5 · 最小 Snap 轨迹</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+SC:wght@300;400;500;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/src/kit/hud.css">
+  <style>
+    /* 直线 vs 最小 Snap. Both modes share the same four 3D waypoints and the
+     * same average flight time so the comparison is apples-to-apples. The
+     * naive mode interpolates piecewise-linearly and a 2nd-order tracker
+     * smooths the commanded position into a physical trajectory — this gives
+     * us finite accel/jerk we can plot, with visible "lurch" overshoot at
+     * every waypoint corner. The min-snap mode solves a piecewise 7th-order
+     * polynomial with C^6 continuity, which is uniquely determined when the
+     * segment times are fixed and is mathematically the snap-optimal solution
+     * for that schedule. The 2nd-order tracker barely sees a lag on the
+     * smooth command, so the drone tracks it cleanly. */
+
+    html, body { margin: 0; background: var(--stage-bg); color: var(--label-strong-fg);
+                 font-family: "Noto Sans SC", sans-serif; overflow: hidden; }
+
+    #charts {
+      position: absolute; bottom: 14px; left: 50%; transform: translateX(-50%);
+      display: flex; gap: 14px;
+      pointer-events: none;
+    }
+    .chart-box {
+      background: var(--label-bg);
+      border: 0.5px solid var(--label-border);
+      border-radius: 6px;
+      padding: 6px 10px;
+      width: 360px;
+    }
+    .chart-title {
+      font-family: "Noto Sans SC", sans-serif;
+      font-size: 11px;
+      letter-spacing: 0.04em;
+      color: var(--label-strong-fg);
+      margin-bottom: 4px;
+    }
+    .chart-title .unit {
+      font-family: "JetBrains Mono", monospace;
+      font-size: 10px;
+      color: var(--hud-unit);
+      margin-left: 6px;
+    }
+    .chart-box canvas { display: block; }
+
+    #note {
+      position: absolute; top: 24px; left: 50%; transform: translateX(-50%);
+      font-family: "JetBrains Mono", monospace;
+      font-size: 11px;
+      color: var(--label-fg);
+      background: var(--label-bg);
+      border: 0.5px solid var(--label-border);
+      border-radius: 3px;
+      padding: 5px 12px;
+      pointer-events: none;
+    }
+  </style>
+</head>
+<body>
+  <div id="stage" style="position:relative;width:100vw;height:100vh"></div>
+  <div id="note"></div>
+  <div id="charts">
+    <div class="chart-box" id="chartA"><div class="chart-title" id="chartATitle"></div><canvas width="700" height="120"></canvas></div>
+    <div class="chart-box" id="chartJ"><div class="chart-title" id="chartJTitle"></div><canvas width="700" height="120"></canvas></div>
+  </div>
+
+  <script type="module">
+    import * as THREE from 'three';
+    import { createEnvironment } from '/src/kit/Environment.js';
+    import { createDrone }       from '/src/kit/Quadrotor.js';
+    import { createTrail }       from '/src/kit/Trajectory.js';
+    import { createPanel }       from '/src/kit/Hud.js';
+    import { labels }            from '/src/kit/labels.js';
+    import { theme, mountThemeToggle, hexToCss } from '/src/kit/theme.js';
+
+    const L = labels.ch05.minSnap;
+    document.getElementById('note').textContent = L.note;
+
+    // --- Waypoints + segment times --------------------------------------
+    // Four waypoints chosen to make the lurch obvious: alternating heights,
+    // tight 90° turn between segments 1 and 2.
+    const W = [
+      new THREE.Vector3(-6, 1.5, -3),
+      new THREE.Vector3(-2, 4.0,  2),
+      new THREE.Vector3( 3, 2.0, -2),
+      new THREE.Vector3( 6, 5.0,  3),
+    ];
+    const TOTAL = 10.0;
+    const chord = [];
+    for (let i = 0; i < 3; i++) chord.push(W[i+1].distanceTo(W[i]));
+    const sumD = chord.reduce((a,b) => a+b, 0);
+    const Tseg = chord.map((d) => TOTAL * d / sumD);   // [T0, T1, T2]
+    const Tcum = [0, Tseg[0], Tseg[0] + Tseg[1], TOTAL];
+
+    // --- Naive: piecewise linear command --------------------------------
+    function naivePos(t) {
+      if (t <= 0) return W[0].clone();
+      if (t >= TOTAL) return W[3].clone();
+      let s = 0;
+      while (s < 2 && t > Tcum[s+1]) s++;
+      const u = (t - Tcum[s]) / (Tcum[s+1] - Tcum[s]);
+      return W[s].clone().lerp(W[s+1], u);
+    }
+
+    // --- Min-snap: piecewise 7th-order polynomial with C^6 continuity ---
+    // 24 unknowns per axis (8 coefs × 3 segments). A is identical across
+    // axes so we LU-decompose once and back-substitute three times.
+    const NSEG = 3, NK = 8, N = NSEG * NK;
+
+    function pTerm(k, d, t) {
+      if (k < d) return 0;
+      let coef = 1;
+      for (let i = 0; i < d; i++) coef *= (k - i);
+      return coef * Math.pow(t, k - d);
+    }
+
+    function buildSystem() {
+      const A = Array.from({ length: N }, () => new Float64Array(N));
+      let row = 0;
+      // Position constraints: p_i(0) = W[i], p_i(T_i) = W[i+1]
+      for (let i = 0; i < NSEG; i++) {
+        // p_i(0) — only c[i*8+0] survives (k=0)
+        A[row][i*NK + 0] = 1; row++;
+        for (let k = 0; k < NK; k++) A[row][i*NK + k] = pTerm(k, 0, Tseg[i]);
+        row++;
+      }
+      // C^d continuity at interior junctions, d = 1..6
+      for (let j = 1; j <= 2; j++) {
+        const segL = j - 1, segR = j;
+        for (let dOrder = 1; dOrder <= 6; dOrder++) {
+          for (let k = 0; k < NK; k++) {
+            A[row][segL*NK + k] = +pTerm(k, dOrder, Tseg[segL]);
+            A[row][segR*NK + k] = -pTerm(k, dOrder, 0);
+          }
+          row++;
+        }
+      }
+      // Endpoint conditions: zero v/a/j at start and end.
+      for (let dOrder = 1; dOrder <= 3; dOrder++) {
+        for (let k = 0; k < NK; k++) A[row][0*NK + k] = pTerm(k, dOrder, 0);
+        row++;
+      }
+      for (let dOrder = 1; dOrder <= 3; dOrder++) {
+        for (let k = 0; k < NK; k++) A[row][2*NK + k] = pTerm(k, dOrder, Tseg[2]);
+        row++;
+      }
+      return A;
+    }
+
+    function gaussSolve(Ain, b) {
+      const n = b.length;
+      const A = Ain.map((r) => Float64Array.from(r));
+      const x = Float64Array.from(b);
+      for (let i = 0; i < n; i++) {
+        let max = Math.abs(A[i][i]), maxRow = i;
+        for (let k = i+1; k < n; k++) {
+          if (Math.abs(A[k][i]) > max) { max = Math.abs(A[k][i]); maxRow = k; }
+        }
+        if (maxRow !== i) {
+          const tmp = A[i]; A[i] = A[maxRow]; A[maxRow] = tmp;
+          const tmpx = x[i]; x[i] = x[maxRow]; x[maxRow] = tmpx;
+        }
+        for (let k = i+1; k < n; k++) {
+          const f = A[k][i] / A[i][i];
+          x[k] -= f * x[i];
+          for (let j = i; j < n; j++) A[k][j] -= f * A[i][j];
+        }
+      }
+      const out = new Float64Array(n);
+      for (let i = n-1; i >= 0; i--) {
+        let s = x[i];
+        for (let j = i+1; j < n; j++) s -= A[i][j] * out[j];
+        out[i] = s / A[i][i];
+      }
+      return out;
+    }
+
+    function buildRHS(axis) {
+      const b = new Float64Array(N);
+      let r = 0;
+      for (let i = 0; i < NSEG; i++) {
+        b[r++] = W[i].getComponent(axis);     // p_i(0)
+        b[r++] = W[i+1].getComponent(axis);   // p_i(T_i)
+      }
+      return b;
+    }
+
+    const Asys = buildSystem();
+    const coef = [
+      gaussSolve(Asys, buildRHS(0)),
+      gaussSolve(Asys, buildRHS(1)),
+      gaussSolve(Asys, buildRHS(2)),
+    ];
+
+    function snapPos(t) {
+      if (t <= 0) return W[0].clone();
+      if (t >= TOTAL) return W[3].clone();
+      let s = 0;
+      while (s < NSEG-1 && t > Tcum[s+1]) s++;
+      const tl = t - Tcum[s];
+      const out = new THREE.Vector3();
+      for (let a = 0; a < 3; a++) {
+        let v = 0;
+        for (let k = 0; k < NK; k++) v += coef[a][s*NK + k] * Math.pow(tl, k);
+        out.setComponent(a, v);
+      }
+      return out;
+    }
+
+    // --- 2nd-order tracker simulation -----------------------------------
+    // The same plant tracks both naive and snap commands. omega = 8 rad/s
+    // gives ~125 ms time constant — fast enough that snap is tracked within
+    // a few mm, slow enough that step-like naive corners overshoot visibly.
+    function simulate(cmdFn) {
+      const dt = 0.005;
+      const M = Math.round(TOTAL / dt);
+      const omega = 8.0, zeta = 0.7;
+      const k = omega * omega, c = 2 * zeta * omega;
+      const c0 = cmdFn(0);
+      let p = [c0.x, c0.y, c0.z];
+      let v = [0, 0, 0];
+      const pos = new Float64Array(M * 3);
+      const acc = new Float64Array(M * 3);
+      for (let i = 0; i < M; i++) {
+        const t = i * dt;
+        const cmd = cmdFn(t);
+        const ax = -c * v[0] + k * (cmd.x - p[0]);
+        const ay = -c * v[1] + k * (cmd.y - p[1]);
+        const az = -c * v[2] + k * (cmd.z - p[2]);
+        pos[i*3+0] = p[0]; pos[i*3+1] = p[1]; pos[i*3+2] = p[2];
+        acc[i*3+0] = ax;   acc[i*3+1] = ay;   acc[i*3+2] = az;
+        v[0] += ax*dt; v[1] += ay*dt; v[2] += az*dt;
+        p[0] += v[0]*dt; p[1] += v[1]*dt; p[2] += v[2]*dt;
+      }
+      // Jerk by 1st-difference of accel.
+      const jerk = new Float64Array(M * 3);
+      for (let i = 1; i < M; i++) {
+        jerk[i*3+0] = (acc[i*3+0] - acc[(i-1)*3+0]) / dt;
+        jerk[i*3+1] = (acc[i*3+1] - acc[(i-1)*3+1]) / dt;
+        jerk[i*3+2] = (acc[i*3+2] - acc[(i-1)*3+2]) / dt;
+      }
+      return { pos, acc, jerk, dt, M };
+    }
+
+    const simNaive = simulate(naivePos);
+    const simSnap  = simulate(snapPos);
+
+    function magAt(arr, i) {
+      const x = arr[i*3], y = arr[i*3+1], z = arr[i*3+2];
+      return Math.hypot(x, y, z);
+    }
+    function peak(arr, M) {
+      let m = 0;
+      for (let i = 0; i < M; i++) m = Math.max(m, magAt(arr, i));
+      return m;
+    }
+
+    const peakA_naive = peak(simNaive.acc,  simNaive.M);
+    const peakJ_naive = peak(simNaive.jerk, simNaive.M);
+    const peakA_snap  = peak(simSnap.acc,   simSnap.M);
+    const peakJ_snap  = peak(simSnap.jerk,  simSnap.M);
+
+    function queryPos(sim, t) {
+      const idx = Math.max(0, Math.min(sim.M - 1, Math.floor(t / sim.dt)));
+      return new THREE.Vector3(sim.pos[idx*3], sim.pos[idx*3+1], sim.pos[idx*3+2]);
+    }
+
+    // --- Scene -----------------------------------------------------------
+    const stage = document.getElementById('stage');
+    const { scene, addLights, dispose: disposeEnv } = createEnvironment({
+      grid: true, fog: true, floor: true, sceneSize: 30, logoClouds: false,
+    });
+    addLights();
+    mountThemeToggle();
+
+    const camera = new THREE.PerspectiveCamera(48, stage.clientWidth / stage.clientHeight, 0.1, 80);
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+    renderer.setSize(stage.clientWidth, stage.clientHeight);
+    stage.appendChild(renderer.domElement);
+
+    // Waypoint markers + label spheres.
+    const wpGeo = new THREE.SphereGeometry(0.13, 16, 12);
+    const wpMat = new THREE.MeshStandardMaterial({ color: theme.colors.waypoint, emissive: theme.colors.waypoint, emissiveIntensity: 0.25 });
+    const wpGroup = new THREE.Group();
+    for (const w of W) {
+      const m = new THREE.Mesh(wpGeo, wpMat);
+      m.position.copy(w);
+      wpGroup.add(m);
+    }
+    scene.add(wpGroup);
+
+    // Naive path line (just the waypoint polyline).
+    const naivePts = W.map(v => v.clone());
+    const naiveGeo = new THREE.BufferGeometry().setFromPoints(naivePts);
+    const naiveMat = new THREE.LineBasicMaterial({ color: 0xe8ecf2, transparent: true, opacity: 0.85 });
+    const naiveLine = new THREE.Line(naiveGeo, naiveMat);
+    scene.add(naiveLine);
+
+    // Snap path line — sample the polynomial densely.
+    const SNAP_SAMPLES = 600;
+    const snapPts = [];
+    for (let i = 0; i <= SNAP_SAMPLES; i++) {
+      const t = (i / SNAP_SAMPLES) * TOTAL;
+      snapPts.push(snapPos(t));
+    }
+    const snapGeo = new THREE.BufferGeometry().setFromPoints(snapPts);
+    const snapMat = new THREE.LineBasicMaterial({ color: theme.colors.planning, transparent: true, opacity: 0.85 });
+    const snapLine = new THREE.Line(snapGeo, snapMat);
+    scene.add(snapLine);
+
+    // Drone + trail.
+    const drone = createDrone({ scale: 0.85, accentColor: theme.colors.executed, showThrustVector: false });
+    drone.group.position.copy(W[0]);
+    scene.add(drone.group);
+
+    const trail = createTrail({ maxPoints: 1200, color: theme.colors.executed });
+    scene.add(trail.line);
+
+    // --- HUD -------------------------------------------------------------
+    const modePanel = createPanel({
+      title: L.modePanel, corner: 'tl', color: 'cyan',
+      items: [
+        { key: 'mode',   label: '', value: L.modeNaive },
+      ],
+    });
+    stage.appendChild(modePanel.el);
+
+    const statsPanel = createPanel({
+      title: L.statsPanel, corner: 'tr', color: 'magenta',
+      items: [
+        { key: 'accelN', label: `${L.accelPeak} · ${L.modeNaive}`, value: peakA_naive.toFixed(1), unit: 'm/s²' },
+        { key: 'accelS', label: `${L.accelPeak} · ${L.modeSnap}`,  value: peakA_snap.toFixed(1),  unit: 'm/s²' },
+        { key: 'jerkN',  label: `${L.jerkPeak} · ${L.modeNaive}`,  value: peakJ_naive.toFixed(0), unit: 'm/s³' },
+        { key: 'jerkS',  label: `${L.jerkPeak} · ${L.modeSnap}`,   value: peakJ_snap.toFixed(0),  unit: 'm/s³' },
+      ],
+    });
+    stage.appendChild(statsPanel.el);
+
+    // --- Charts ---------------------------------------------------------
+    // Each chart shows BOTH naive (faded) and snap (faded) magnitude curves
+    // simultaneously. The currently-flying mode is rendered in bright
+    // executed-magenta so the contrast is automatic. A vertical play head
+    // marks the current sim time so the audience can sync chart features
+    // with the drone's motion in 3D.
+    const chartA = setupChart('chartA', 'chartATitle', `${L.accelChart}`, 'm/s²',
+      simNaive.acc, simSnap.acc, peakA_naive * 1.05);
+    const chartJ = setupChart('chartJ', 'chartJTitle', `${L.jerkChart}`, 'm/s³',
+      simNaive.jerk, simSnap.jerk, peakJ_naive * 1.05);
+
+    function setupChart(boxId, titleId, titleText, unit, naiveArr, snapArr, yMax) {
+      const titleEl = document.getElementById(titleId);
+      titleEl.innerHTML = titleText + `<span class="unit">0 – ${yMax.toFixed(0)} ${unit}</span>`;
+      const canvas = document.getElementById(boxId).querySelector('canvas');
+      const dpr = Math.min(window.devicePixelRatio || 1, 2);
+      const W = canvas.width / dpr, H = canvas.height / dpr;
+      canvas.style.width = W + 'px';
+      canvas.style.height = H + 'px';
+      canvas.width = W * dpr; canvas.height = H * dpr;
+      const ctx = canvas.getContext('2d');
+      ctx.scale(dpr, dpr);
+
+      // Pre-compute pixel-space points for both signals once.
+      const M = simNaive.M;
+      function magArr(src) {
+        const m = new Float32Array(M);
+        for (let i = 0; i < M; i++) m[i] = magAt(src, i);
+        return m;
+      }
+      const naiveMag = magArr(naiveArr);
+      const snapMag  = magArr(snapArr);
+
+      // Faded signal colour is read from theme via the --hud-unit CSS var on
+      // <html>; this gives a neutral gray in either palette without us
+      // hard-coding a hex per theme.
+      const fadedColor = theme.mode === 'light' ? 'rgba(80, 95, 115, 0.6)' : 'rgba(180, 200, 220, 0.45)';
+      const activeColor = hexToCss(theme.colors.executed);
+      const headColor   = hexToCss(theme.colors.planning);
+
+      function render(activeMode, simT) {
+        ctx.clearRect(0, 0, W, H);
+        // Axis baseline.
+        ctx.strokeStyle = fadedColor;
+        ctx.globalAlpha = 0.5;
+        ctx.lineWidth = 0.5;
+        ctx.beginPath();
+        ctx.moveTo(0, H - 0.5); ctx.lineTo(W, H - 0.5); ctx.stroke();
+        ctx.globalAlpha = 1;
+
+        function drawSignal(arr, color, opacity, lineW) {
+          ctx.globalAlpha = opacity;
+          ctx.strokeStyle = color;
+          ctx.lineWidth = lineW;
+          ctx.beginPath();
+          for (let i = 0; i < M; i++) {
+            const x = (i / (M - 1)) * W;
+            const y = H - Math.min(1, arr[i] / yMax) * (H - 2);
+            if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+          }
+          ctx.stroke();
+        }
+
+        const isNaiveActive = activeMode === 'naive';
+        drawSignal(isNaiveActive ? snapMag : naiveMag, fadedColor, 0.55, 1);
+        drawSignal(isNaiveActive ? naiveMag : snapMag, activeColor, 1, 1.5);
+
+        // Play head.
+        ctx.globalAlpha = 0.85;
+        ctx.strokeStyle = headColor;
+        ctx.lineWidth = 1;
+        const px = (simT / TOTAL) * W;
+        ctx.beginPath();
+        ctx.moveTo(px, 0); ctx.lineTo(px, H); ctx.stroke();
+        ctx.globalAlpha = 1;
+      }
+
+      return { render };
+    }
+
+    // --- Camera (cinematic-ish orbit) -----------------------------------
+    // Constant slow orbit, with a zoom-in over mid-flight to make the lurch
+    // around interior waypoints obvious. Reset orbit angle every mode so the
+    // viewer sees the same flight from a similar starting angle each time.
+    function getCam(modeT) {
+      // modeT: 0..MODE_DURATION (12s)
+      const a = (modeT * 0.16);          // slow orbit, < ¼ revolution per mode
+      const u = clamp((modeT - 1) / (TOTAL - 0), 0, 1); // 0..1 over flight portion
+      const zoom = u < 0.5
+        ? lerp(1, 0.65, smooth(u / 0.5))
+        : lerp(0.65, 1, smooth((u - 0.5) / 0.5));
+      const radius = 14 * zoom;
+      const height = 5 + 2 * (1 - zoom);
+      camera.position.set(Math.cos(a) * radius, height, Math.sin(a) * radius);
+      camera.lookAt(0, 2, 0);
+    }
+    function lerp(a, b, u) { return a + (b - a) * u; }
+    function smooth(u) { return u*u*(3 - 2*u); }
+    function clamp(x, lo, hi) { return x < lo ? lo : x > hi ? hi : x; }
+
+    // --- Loop ------------------------------------------------------------
+    const MODE_DURATION = 12.0;     // 1 s pre-roll + 10 s flight + 1 s hold
+    const LOOP = MODE_DURATION * 2;  // naive then snap
+    let loopT0 = performance.now() * 0.001;
+    let lastFlightT = -1; // for trail clear logic
+
+    (function tick() {
+      const now = performance.now() * 0.001;
+      const t = (now - loopT0) % LOOP;
+      const modeIdx = t < MODE_DURATION ? 0 : 1;        // 0 naive, 1 snap
+      const modeT  = t - modeIdx * MODE_DURATION;       // 0..12 within mode
+      const flightT = clamp(modeT - 1, 0, TOTAL);       // 0..10 actual flight
+
+      const sim = modeIdx === 0 ? simNaive : simSnap;
+      const activeMode = modeIdx === 0 ? 'naive' : 'snap';
+
+      // Drone position from sim.
+      const p = queryPos(sim, flightT);
+      drone.group.position.copy(p);
+
+      // Yaw with horizontal velocity direction (use a small lookahead).
+      const pAhead = queryPos(sim, Math.min(TOTAL, flightT + 0.05));
+      const dx = pAhead.x - p.x, dz = pAhead.z - p.z;
+      if (Math.hypot(dx, dz) > 0.001) drone.group.rotation.y = Math.atan2(dx, dz);
+
+      drone.update(0.016);
+
+      // Trail: clear at start of each mode; push during flight.
+      if (modeT < 0.05 && lastFlightT > 0) { trail.clear(); }
+      if (flightT > 0 && flightT < TOTAL && flightT - lastFlightT > 0.02) {
+        trail.push(p);
+      }
+      lastFlightT = flightT;
+
+      // Path-line emphasis: brighten the active path, fade the other.
+      naiveLine.material.opacity = activeMode === 'naive' ? 0.95 : 0.20;
+      snapLine.material.opacity  = activeMode === 'snap'  ? 0.95 : 0.20;
+
+      // HUD.
+      modePanel.setValue('mode', activeMode === 'naive' ? L.modeNaive : L.modeSnap);
+
+      // Camera.
+      getCam(modeT);
+
+      // Charts.
+      chartA.render(activeMode, flightT);
+      chartJ.render(activeMode, flightT);
+
+      renderer.render(scene, camera);
+      requestAnimationFrame(tick);
+    })();
+
+    // --- Resize + dispose ------------------------------------------------
+    addEventListener('resize', () => {
+      camera.aspect = stage.clientWidth / stage.clientHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(stage.clientWidth, stage.clientHeight);
+    });
+    addEventListener('beforeunload', () => {
+      drone.dispose(); trail.dispose();
+      wpGeo.dispose(); wpMat.dispose();
+      naiveGeo.dispose(); naiveMat.dispose();
+      snapGeo.dispose(); snapMat.dispose();
+      modePanel.dispose(); statsPanel.dispose();
+      disposeEnv(); renderer.dispose();
+    });
+  </script>
+</body>
+</html>
