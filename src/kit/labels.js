@@ -201,6 +201,34 @@ export const labels = {
       errorAxis:     '误差旋转轴',
     },
   },
+  ch04: {
+    imuDriftTitle: 'IMU 漂移 vs 卡尔曼融合',
+    vioTitle:      'VIO 特征跟踪',
+    slamTitle:     'SLAM 闭环校正',
+    imuDrift: {
+      // P0-7. Three drones fly the same ellipse. Truth is analytical; the
+      // pure-IMU drone double-integrates a biased + noisy accelerometer;
+      // the fused drone runs three independent 2-D Kalman filters (one per
+      // world axis) using the IMU as a 200 Hz prediction and a 1 Hz GPS-like
+      // position fix as the correction.
+      filterPanel:   '估计器',
+      errorPanel:    '位置误差',
+      chartTitle:    '位置误差 / 时间',
+      truthLabel:    '真值',
+      imuLabel:      '纯 IMU',
+      fusedLabel:    '融合',
+      truthLegend:   '参考轨迹 · 真值',
+      imuLegend:     '纯 IMU 积分 · 漂移',
+      fusedLegend:   '卡尔曼融合 · 有界',
+      gpsLegend:     'GPS 测量 · 1 Hz',
+      imuRate:       'IMU 频率',
+      gpsRate:       'GPS 频率',
+      gpsNoise:      'GPS σ',
+      stateDim:      '状态维度',
+      note:          'IMU 偏置 → 二次积分发散 · GPS 1 Hz 修正使误差有界',
+      hint:          '30 s 循环 · 偏置与噪声每周期重采样',
+    },
+  },
   ch05: {
     searchTitle:    'A*/RRT* 搜索扩展',
     minSnapTitle:   '最小 Snap 轨迹',

@@ -1,0 +1,515 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Ch4 · IMU 漂移 vs 卡尔曼融合</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+SC:wght@300;400;500;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/src/kit/hud.css">
+  <style>
+    /* IMU drift vs Kalman fusion. Three drones fly the same parametric loop:
+     * truth (analytical), pure-IMU integration (biased + noisy → drifts), and
+     * a Kalman-filtered estimate that fuses 200 Hz IMU predictions with a
+     * 1 Hz "GPS" position fix. The teaching contrast is unbounded vs. bounded
+     * error — choose the camera framing and chart Y range so the divergence
+     * is visible to the back row. */
+    html, body { margin: 0; background: var(--stage-bg); color: var(--label-strong-fg);
+                 font-family: "Noto Sans SC", sans-serif; overflow: hidden; }
+    #note {
+      position: absolute; top: 24px; left: 50%; transform: translateX(-50%);
+      font-family: "JetBrains Mono", monospace;
+      font-size: 11px;
+      color: var(--label-fg); background: var(--label-bg);
+      border: 0.5px solid var(--label-border);
+      border-radius: 3px;
+      padding: 5px 12px;
+      pointer-events: none;
+    }
+    #legend {
+      position: absolute; bottom: 16px; left: 16px;
+      font-family: "JetBrains Mono", monospace;
+      font-size: 11px;
+      color: var(--label-fg); background: var(--label-bg);
+      border: 0.5px solid var(--label-border);
+      border-radius: 6px;
+      padding: 8px 12px;
+      pointer-events: none;
+      letter-spacing: 0.02em;
+      line-height: 1.7;
+    }
+    #legend .row { display: flex; align-items: center; gap: 8px; }
+    #legend .swatch {
+      display: inline-block; width: 18px; height: 4px; border-radius: 2px;
+    }
+    /* Chart sits above the floating ☾/☀ toggle (32 px + 16 px gap). */
+    #chart-wrap {
+      position: absolute; bottom: 64px; right: 16px;
+      font-family: "JetBrains Mono", monospace;
+      font-size: 10px;
+      color: var(--label-fg); background: var(--label-bg);
+      border: 0.5px solid var(--label-border);
+      border-radius: 6px;
+      padding: 8px 10px;
+      pointer-events: none;
+    }
+    #chart-wrap .chart-title {
+      font-family: "Noto Sans SC", sans-serif;
+      font-size: 11px;
+      color: var(--label-strong-fg);
+      margin-bottom: 4px;
+      letter-spacing: 0.04em;
+      opacity: 0.85;
+    }
+    #chart-wrap .chart-axis { color: var(--hud-unit); margin-top: 2px; text-align: right; }
+    #chart-wrap canvas { display: block; }
+  </style>
+</head>
+<body>
+  <div id="stage" style="position:relative;width:100vw;height:100vh"></div>
+  <div id="note"></div>
+  <div id="legend"></div>
+  <div id="chart-wrap">
+    <div class="chart-title" id="chart-title"></div>
+    <canvas id="err-chart"></canvas>
+    <div class="chart-axis">0 — 30 s · 0 — 18 m</div>
+  </div>
+
+  <script type="module">
+    import * as THREE from 'three';
+    import { createEnvironment } from '/src/kit/Environment.js';
+    import { createDrone }       from '/src/kit/Quadrotor.js';
+    import { createTrail }       from '/src/kit/Trajectory.js';
+    import { createPanel }       from '/src/kit/Hud.js';
+    import { labels }            from '/src/kit/labels.js';
+    import { theme, mountThemeToggle, hexToCss } from '/src/kit/theme.js';
+
+    const L = labels.ch04.imuDrift;
+    document.getElementById('note').textContent = L.note;
+    document.getElementById('chart-title').textContent = L.chartTitle;
+
+    // ---------------------------------------------------------------------
+    // Trajectory (analytical). Horizontal ellipse with a small vertical wobble;
+    // differentiated twice by hand so "true" body acceleration is exact and
+    // only IMU bias / white noise contaminate the integrated path.
+    //   p(t)  = ( R cos ωt,  H + 0.6 sin 2ωt,  (R/2) sin ωt )
+    //   v(t)  = (-Rω sin ωt, 1.2 ω cos 2ωt,    (R/2) ω cos ωt )
+    //   a(t)  = (-Rω² cos ωt, -2.4 ω² sin 2ωt, -(R/2) ω² sin ωt )
+    // ---------------------------------------------------------------------
+    const R = 6.0, H = 2.5, OMEGA = 2 * Math.PI / 30;
+    function truthPos(t, out = new THREE.Vector3()) {
+      return out.set(
+         R * Math.cos(OMEGA * t),
+         H + 0.6 * Math.sin(2 * OMEGA * t),
+         (R / 2) * Math.sin(OMEGA * t),
+      );
+    }
+    function truthVel(t, out = new THREE.Vector3()) {
+      return out.set(
+        -R * OMEGA * Math.sin(OMEGA * t),
+         1.2 * OMEGA * Math.cos(2 * OMEGA * t),
+         (R / 2) * OMEGA * Math.cos(OMEGA * t),
+      );
+    }
+    function truthAcc(t, out = new THREE.Vector3()) {
+      return out.set(
+        -R * OMEGA * OMEGA * Math.cos(OMEGA * t),
+        -2.4 * OMEGA * OMEGA * Math.sin(2 * OMEGA * t),
+        -(R / 2) * OMEGA * OMEGA * Math.sin(OMEGA * t),
+      );
+    }
+
+    // ---------------------------------------------------------------------
+    // Estimator config. SIGMA_A is the per-axis IMU white-noise σ; bias is
+    // the constant component re-rolled each loop so each replay differs but
+    // stays within the framing band. Bias dominates the 30 s drift budget
+    // (0.04 m/s² × 30² / 2 ≈ 18 m worst case per axis), which is exactly
+    // what we want to make visible.
+    // ---------------------------------------------------------------------
+    const IMU_HZ = 200, IMU_DT = 1 / IMU_HZ;
+    const GPS_PERIOD = 1.0;            // 1 Hz
+    const SIGMA_A = 0.04;              // m/s²
+    const SIGMA_G = 0.30;              // m
+    const Q_A = SIGMA_A * SIGMA_A;
+    const R_GPS = SIGMA_G * SIGMA_G;
+    const bias = new THREE.Vector3();
+    function rerollBias() {
+      bias.set(
+        (Math.random() - 0.5) * 0.06,
+        (Math.random() - 0.5) * 0.04,
+        (Math.random() - 0.5) * 0.06,
+      );
+    }
+    function gauss(sigma) {
+      // Box–Muller. Throwing away the second sample is wasteful but readable.
+      const u1 = Math.max(1e-9, Math.random()), u2 = Math.random();
+      return sigma * Math.sqrt(-2 * Math.log(u1)) * Math.cos(2 * Math.PI * u2);
+    }
+
+    // Per-axis 2-D Kalman filter. The full 6-D filter (state = [p; v]) is
+    // block-diagonal per world axis when accelerometer noise is treated as
+    // diagonal — so this collapses into three independent 2×2 filters, which
+    // is much easier to read than 6×6 matrix code.
+    //   F = [[1, dt],   B = [[½dt²],   H = [1, 0]
+    //        [0,  1]],       [ dt ]],
+    //   Q = q_a · [[dt⁴/4, dt³/2], [dt³/2, dt²]],   R = σ_gps²
+    function makeAxisKF(p0, v0) {
+      return { p: p0, v: v0, P00: 0.01, P01: 0, P10: 0, P11: 0.01 };
+    }
+    function predictAxis(s, aImu, dt) {
+      // Semi-implicit Euler. Symplectic on harmonic motion — without it Euler
+      // would visibly spiral the noiseless IMU drone outward over 30 s, which
+      // would muddy the bias-vs-fusion teaching point.
+      s.v += aImu * dt;
+      s.p += s.v * dt;
+      // P ← F P Fᵀ + Q.
+      const P00 = s.P00 + dt * (s.P10 + s.P01) + dt * dt * s.P11;
+      const P01 = s.P01 + dt * s.P11;
+      const P10 = s.P10 + dt * s.P11;
+      const P11 = s.P11;
+      const dt2 = dt * dt, dt3 = dt2 * dt, dt4 = dt2 * dt2;
+      s.P00 = P00 + Q_A * dt4 / 4;
+      s.P01 = P01 + Q_A * dt3 / 2;
+      s.P10 = P10 + Q_A * dt3 / 2;
+      s.P11 = P11 + Q_A * dt2;
+    }
+    function updateAxis(s, z) {
+      const sCov = s.P00 + R_GPS;
+      const K0 = s.P00 / sCov;
+      const K1 = s.P10 / sCov;
+      const y = z - s.p;
+      s.p += K0 * y;
+      s.v += K1 * y;
+      const P00 = (1 - K0) * s.P00;
+      const P01 = (1 - K0) * s.P01;
+      const P10 = s.P10 - K1 * s.P00;
+      const P11 = s.P11 - K1 * s.P01;
+      s.P00 = P00; s.P01 = P01; s.P10 = P10; s.P11 = P11;
+    }
+
+    // ---------------------------------------------------------------------
+    // Sim state, reset at the start of each cycle.
+    // ---------------------------------------------------------------------
+    const LOOP    = 30;     // s per cycle
+    const ERR_MAX = 18;     // chart Y range, m
+    const HIST_CAP = 1024;  // ring buffer for the per-cycle error chart
+    const histT     = new Float32Array(HIST_CAP);
+    const histImu   = new Float32Array(HIST_CAP);
+    const histFused = new Float32Array(HIST_CAP);
+    let histCount = 0;
+
+    let simT = 0;
+    let gpsTimer = 0;
+    const imuP = new THREE.Vector3();
+    const imuV = new THREE.Vector3();
+    let kfX, kfY, kfZ;
+
+    function resetCycle() {
+      simT = 0;
+      gpsTimer = 0;
+      rerollBias();
+      const p0 = truthPos(0), v0 = truthVel(0);
+      imuP.copy(p0); imuV.copy(v0);
+      kfX = makeAxisKF(p0.x, v0.x);
+      kfY = makeAxisKF(p0.y, v0.y);
+      kfZ = makeAxisKF(p0.z, v0.z);
+      histCount = 0;
+      lastTrailPush = -1;
+      trailImu.clear(); trailFused.clear();
+    }
+
+    // ---------------------------------------------------------------------
+    // Scene. Loop is at y ≈ 2.5 ± 0.6, x and z both extend to ~6 m for the
+    // truth ellipse, but the IMU drone may drift another 12–18 m off any
+    // axis — camera picked wide and high enough to keep all three in frame.
+    // logoClouds disabled because the clouds (y = 6–12) drift through the
+    // upper viewport and would read as confetti over the trails.
+    // ---------------------------------------------------------------------
+    const stage = document.getElementById('stage');
+    const { scene, addLights, dispose: disposeEnv } = createEnvironment({
+      grid: true, fog: true, floor: true, sceneSize: 60, logoClouds: false,
+    });
+    addLights();
+    mountThemeToggle();
+
+    const camera = new THREE.PerspectiveCamera(52, stage.clientWidth / stage.clientHeight, 0.1, 200);
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+    renderer.setSize(stage.clientWidth, stage.clientHeight);
+    stage.appendChild(renderer.domElement);
+
+    // Reference loop drawn as a faint cyan ring. Dense sampling so the curve
+    // reads as smooth at any orbit angle.
+    const refSamples = [];
+    for (let i = 0; i <= 240; i++) refSamples.push(truthPos((i / 240) * LOOP, new THREE.Vector3()));
+    const refGeo = new THREE.BufferGeometry().setFromPoints(refSamples);
+    const refMat = new THREE.LineBasicMaterial({
+      color: theme.colors.planning, transparent: true, opacity: 0.55,
+    });
+    const refLine = new THREE.LineLoop(refGeo, refMat);
+    scene.add(refLine);
+
+    // Three drones. Truth uses a neutral grey that reads on both bg modes;
+    // IMU uses the executed slot (magenta — "actual but wrong" pairs the
+    // chapter visually with the trail color); fused uses the perception
+    // slot (green — sensed-and-corrected).
+    const truthBody = theme.mode === 'light' ? 0x1a2332 : 0xc0c8d4;
+    const truthAccent = theme.mode === 'light' ? 0x6b7787 : 0xe8ecf2;
+    const truth = createDrone({ scale: 0.85, bodyColor: truthBody, accentColor: truthAccent });
+    const imu   = createDrone({ scale: 0.70, bodyColor: 0x4a2030, accentColor: theme.colors.executed });
+    const fused = createDrone({ scale: 0.70, bodyColor: 0x204a2a, accentColor: theme.colors.perception });
+    scene.add(truth.group); scene.add(imu.group); scene.add(fused.group);
+
+    const trailImu   = createTrail({ maxPoints: 1200, color: theme.colors.executed });
+    const trailFused = createTrail({ maxPoints: 1200, color: theme.colors.perception });
+    scene.add(trailImu.line); scene.add(trailFused.line);
+
+    // ---------------------------------------------------------------------
+    // GPS pings. Each fix spawns a small expanding ring at the noisy GPS
+    // measurement position. Pre-allocate a pool; recycle on overflow. The
+    // ring sits parallel to the floor so it reads as a "drop-pin" hovering
+    // at the measured altitude.
+    // ---------------------------------------------------------------------
+    const PING_COL = 0xb070ff;
+    const PING_POOL = 6;
+    const pingDisposables = [];
+    const pings = [];
+    for (let i = 0; i < PING_POOL; i++) {
+      const geo = new THREE.RingGeometry(0.18, 0.24, 28);
+      geo.rotateX(-Math.PI / 2);
+      const mat = new THREE.MeshBasicMaterial({
+        color: PING_COL, transparent: true, opacity: 0, side: THREE.DoubleSide, depthWrite: false,
+      });
+      const m = new THREE.Mesh(geo, mat);
+      m.visible = false;
+      scene.add(m);
+      pings.push({ mesh: m, t0: -1, lifeT: 0.8 });
+      pingDisposables.push(geo, mat);
+    }
+    let nextPing = 0;
+    function spawnPing(p) {
+      const slot = pings[nextPing];
+      nextPing = (nextPing + 1) % PING_POOL;
+      slot.mesh.position.copy(p);
+      slot.t0 = performance.now() * 0.001;
+      slot.mesh.visible = true;
+      slot.mesh.scale.setScalar(0.5);
+      slot.mesh.material.opacity = 0.95;
+    }
+    function updatePings(now) {
+      for (const p of pings) {
+        if (p.t0 < 0) continue;
+        const u = (now - p.t0) / p.lifeT;
+        if (u >= 1) { p.mesh.visible = false; p.t0 = -1; continue; }
+        p.mesh.scale.setScalar(0.5 + 2.5 * u);
+        p.mesh.material.opacity = 0.95 * (1 - u);
+      }
+    }
+
+    // ---------------------------------------------------------------------
+    // HUD. Filter config top-left, per-drone error readouts top-right,
+    // legend bottom-left, error chart bottom-right (above the toggle chip).
+    // ---------------------------------------------------------------------
+    const filterPanel = createPanel({
+      title: L.filterPanel, corner: 'tl', color: 'cyan',
+      items: [
+        { key: 'imuRate',  label: L.imuRate,  value: '200',  unit: 'Hz' },
+        { key: 'gpsRate',  label: L.gpsRate,  value: '1',    unit: 'Hz' },
+        { key: 'gpsNoise', label: L.gpsNoise, value: SIGMA_G.toFixed(2), unit: 'm' },
+        { key: 'state',    label: L.stateDim, value: '6' },
+      ],
+    });
+    stage.appendChild(filterPanel.el);
+
+    const errPanel = createPanel({
+      title: L.errorPanel, corner: 'tr', color: 'magenta',
+      items: [
+        { key: 'truth', label: L.truthLabel, value: '0.00', unit: 'm' },
+        { key: 'imu',   label: L.imuLabel,   value: '0.00', unit: 'm' },
+        { key: 'fused', label: L.fusedLabel, value: '0.00', unit: 'm' },
+      ],
+    });
+    stage.appendChild(errPanel.el);
+
+    const legend = document.getElementById('legend');
+    function legendRow(swatchCss, text) {
+      const row = document.createElement('div'); row.className = 'row';
+      const sw = document.createElement('span'); sw.className = 'swatch';
+      sw.style.background = swatchCss;
+      const tx = document.createElement('span'); tx.textContent = text;
+      row.appendChild(sw); row.appendChild(tx);
+      return row;
+    }
+    legend.appendChild(legendRow(hexToCss(theme.colors.planning),   L.truthLegend));
+    legend.appendChild(legendRow(hexToCss(theme.colors.executed),   L.imuLegend));
+    legend.appendChild(legendRow(hexToCss(theme.colors.perception), L.fusedLegend));
+    legend.appendChild(legendRow('#b070ff', L.gpsLegend));
+
+    // Error chart. Two overlaid lines (red = pure-IMU error, green = fused
+    // error) over the current cycle. Reset whenever resetCycle() fires.
+    const CHART_W = 280, CHART_H = 90;
+    const chartCv = document.getElementById('err-chart');
+    const cdpr = Math.min(devicePixelRatio || 1, 2);
+    chartCv.width  = CHART_W * cdpr;
+    chartCv.height = CHART_H * cdpr;
+    chartCv.style.width  = CHART_W + 'px';
+    chartCv.style.height = CHART_H + 'px';
+    const cx = chartCv.getContext('2d');
+    cx.scale(cdpr, cdpr);
+    function drawChart() {
+      cx.clearRect(0, 0, CHART_W, CHART_H);
+      const divider = getComputedStyle(document.body).getPropertyValue('--hud-divider').trim()
+                      || 'rgba(255,255,255,0.10)';
+      cx.strokeStyle = divider;
+      cx.lineWidth = 0.5;
+      // Y-grid every 5 m so the audience can read a magnitude off the chart.
+      for (let g = 5; g < ERR_MAX; g += 5) {
+        const y = CHART_H - (g / ERR_MAX) * CHART_H;
+        cx.beginPath(); cx.moveTo(0, y); cx.lineTo(CHART_W, y); cx.stroke();
+      }
+      // Time playhead at the current cycle position — gives the audience a
+      // sense that the chart is live, not pre-baked.
+      const px = (Math.min(simT, LOOP) / LOOP) * CHART_W;
+      cx.strokeStyle = 'rgba(150,150,160,0.35)';
+      cx.beginPath(); cx.moveTo(px, 0); cx.lineTo(px, CHART_H); cx.stroke();
+
+      function plot(arr, color) {
+        if (histCount < 2) return;
+        cx.strokeStyle = color;
+        cx.lineWidth = 1.4;
+        cx.beginPath();
+        for (let i = 0; i < histCount; i++) {
+          const x = (histT[i] / LOOP) * CHART_W;
+          const y = CHART_H - Math.min(1, arr[i] / ERR_MAX) * CHART_H;
+          if (i === 0) cx.moveTo(x, y); else cx.lineTo(x, y);
+        }
+        cx.stroke();
+      }
+      plot(histImu,   hexToCss(theme.colors.executed));
+      plot(histFused, hexToCss(theme.colors.perception));
+    }
+
+    // ---------------------------------------------------------------------
+    // Sim sub-step. Runs at IMU rate (200 Hz). Render loop accumulates real
+    // time and drains the accumulator before drawing.
+    // ---------------------------------------------------------------------
+    const _aTrue = new THREE.Vector3();
+    const _pTrue = new THREE.Vector3();
+    function simStep(dt) {
+      simT += dt;
+      truthAcc(simT, _aTrue);
+      const aImuX = _aTrue.x + bias.x + gauss(SIGMA_A);
+      const aImuY = _aTrue.y + bias.y + gauss(SIGMA_A);
+      const aImuZ = _aTrue.z + bias.z + gauss(SIGMA_A);
+
+      // Pure-IMU mechanization (semi-implicit Euler). Bias is the dominant
+      // long-term error source; white noise is a minor random walk.
+      imuV.x += aImuX * dt;
+      imuV.y += aImuY * dt;
+      imuV.z += aImuZ * dt;
+      imuP.x += imuV.x * dt;
+      imuP.y += imuV.y * dt;
+      imuP.z += imuV.z * dt;
+
+      predictAxis(kfX, aImuX, dt);
+      predictAxis(kfY, aImuY, dt);
+      predictAxis(kfZ, aImuZ, dt);
+
+      gpsTimer += dt;
+      if (gpsTimer >= GPS_PERIOD) {
+        gpsTimer -= GPS_PERIOD;
+        truthPos(simT, _pTrue);
+        const zx = _pTrue.x + gauss(SIGMA_G);
+        const zy = _pTrue.y + gauss(SIGMA_G);
+        const zz = _pTrue.z + gauss(SIGMA_G);
+        updateAxis(kfX, zx);
+        updateAxis(kfY, zy);
+        updateAxis(kfZ, zz);
+        spawnPing(new THREE.Vector3(zx, zy, zz));
+      }
+    }
+
+    // ---------------------------------------------------------------------
+    // Render loop. Sub-step at 200 Hz, render at vsync, push trails + chart
+    // history at ~30 Hz to keep buffers bounded.
+    // ---------------------------------------------------------------------
+    const clock = new THREE.Clock();
+    const _truthV = new THREE.Vector3();
+    const _eVec = new THREE.Vector3();
+    let acc = 0;
+    let lastTrailPush = -1;
+
+    resetCycle();
+
+    (function tick() {
+      const dt = Math.min(0.05, clock.getDelta());
+      const now = performance.now() * 0.001;
+      acc += dt;
+      while (acc >= IMU_DT) { simStep(IMU_DT); acc -= IMU_DT; }
+
+      truthPos(simT, _pTrue);
+      truth.group.position.copy(_pTrue);
+      imu.group.position.copy(imuP);
+      fused.group.position.set(kfX.p, kfY.p, kfZ.p);
+
+      // Yaw drones along their (estimated) velocity. Truth uses the analytic
+      // velocity; the others use their integrated state.
+      truthVel(simT, _truthV);
+      truth.group.rotation.y = Math.atan2(_truthV.x, _truthV.z);
+      if (Math.hypot(imuV.x, imuV.z) > 1e-3) {
+        imu.group.rotation.y = Math.atan2(imuV.x, imuV.z);
+      }
+      if (Math.hypot(kfX.v, kfZ.v) > 1e-3) {
+        fused.group.rotation.y = Math.atan2(kfX.v, kfZ.v);
+      }
+
+      if (simT - lastTrailPush >= 1 / 30 || simT < lastTrailPush) {
+        lastTrailPush = simT;
+        trailImu.push(imu.group.position);
+        trailFused.push(fused.group.position);
+        if (histCount < HIST_CAP) {
+          histT[histCount]     = simT;
+          histImu[histCount]   = _eVec.copy(imu.group.position).sub(_pTrue).length();
+          histFused[histCount] = _eVec.copy(fused.group.position).sub(_pTrue).length();
+          histCount++;
+        }
+      }
+
+      truth.update(dt); imu.update(dt); fused.update(dt);
+      updatePings(now);
+      drawChart();
+
+      const eImu   = _eVec.copy(imu.group.position).sub(_pTrue).length();
+      const eFused = _eVec.copy(fused.group.position).sub(_pTrue).length();
+      errPanel.setValue('imu',   eImu.toFixed(2));
+      errPanel.setValue('fused', eFused.toFixed(2));
+
+      // Slow orbit centred on the loop. Wide enough to keep a wandering IMU
+      // drone in frame even at the peak of its drift.
+      const a = now * 0.10;
+      camera.position.set(Math.cos(a) * 22, 16, Math.sin(a) * 22);
+      camera.lookAt(0, H, 0);
+
+      renderer.render(scene, camera);
+
+      if (simT >= LOOP) resetCycle();
+      requestAnimationFrame(tick);
+    })();
+
+    addEventListener('resize', () => {
+      camera.aspect = stage.clientWidth / stage.clientHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(stage.clientWidth, stage.clientHeight);
+    });
+    addEventListener('beforeunload', () => {
+      truth.dispose(); imu.dispose(); fused.dispose();
+      trailImu.dispose(); trailFused.dispose();
+      refGeo.dispose(); refMat.dispose();
+      for (const d of pingDisposables) d.dispose();
+      filterPanel.dispose(); errPanel.dispose();
+      disposeEnv(); renderer.dispose();
+    });
+  </script>
+</body>
+</html>
