@@ -228,6 +228,27 @@ export const labels = {
       note:          'IMU 偏置 → 二次积分发散 · GPS 1 Hz 修正使误差有界',
       hint:          '30 s 循环 · 偏置与噪声每周期重采样',
     },
+    vio: {
+      // P0-8. Drone orbits a central pillar while its onboard camera tracks
+      // ~50 features (sparse colored points scattered across box faces,
+      // ground, and air). The onboard view is rendered live; per-feature
+      // optical-flow polylines are drawn as a DOM canvas overlay over that
+      // viewport. A handful of features fail mid-loop to show VIO isn't
+      // perfect.
+      onboardLabel:  '机载相机',
+      externalLabel: '外部视角',
+      trackerPanel:  '特征跟踪',
+      stateLabel:    '状态',
+      tracked:       '跟踪中',
+      reproj:        '重投影误差',
+      total:         '场景特征',
+      lost:          '已丢失',
+      legendActive:  '活跃跟踪',
+      legendFailing: '失效闪烁',
+      legendFlow:    '光流轨迹 · 8 帧',
+      note:          '机载相机 + IMU → VIO · 帧间特征匹配恢复运动',
+      hint:          '20 s 循环 · 随机失效模拟跟踪丢失',
+    },
   },
   ch05: {
     searchTitle:    'A*/RRT* 搜索扩展',

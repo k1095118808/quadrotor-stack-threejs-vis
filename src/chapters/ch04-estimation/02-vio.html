@@ -1,0 +1,508 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Ch4 · VIO 特征跟踪</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+SC:wght@300;400;500;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/src/kit/hud.css">
+  <style>
+    /* VIO feature tracking. Single scene, two viewports rendered with one
+     * WebGLRenderer + setScissorTest + setViewport. Top half is the drone's
+     * onboard camera (a child of the drone group); bottom half is an orbiting
+     * external camera that shows the drone, the trail, and the feature
+     * landmarks. A DOM canvas overlay sits on top of the onboard viewport and
+     * draws per-feature optical-flow polylines + colored dots — the dots
+     * exactly coincide with the projected positions of the in-scene feature
+     * spheres, so the audience can mentally connect "where the feature lives
+     * in 3D" with "where it lands on the camera." */
+    html, body { margin: 0; background: var(--stage-bg); color: var(--label-strong-fg);
+                 font-family: "Noto Sans SC", sans-serif; overflow: hidden; }
+    #stage { position: relative; width: 100vw; height: 100vh; }
+    /* Onboard overlay covers the top half of the stage in CSS units. The
+     * canvas backing store is DPR-scaled in JS for crisp dots/lines. */
+    #onboard-overlay {
+      position: absolute; left: 0; top: 0; width: 100vw; height: 50vh;
+      pointer-events: none;
+    }
+    /* Hairline that visually separates the two viewports. */
+    #split-divider {
+      position: absolute; left: 0; right: 0; top: 50vh; height: 0;
+      border-top: 0.5px dashed var(--label-border);
+      pointer-events: none;
+      z-index: 5;
+    }
+    .corner-tag {
+      position: absolute; padding: 4px 9px;
+      font-family: "JetBrains Mono", monospace;
+      font-size: 10px;
+      color: var(--label-fg); background: var(--label-bg);
+      border: 0.5px solid var(--label-border);
+      border-radius: 3px;
+      letter-spacing: 0.05em;
+      pointer-events: none;
+      text-transform: uppercase;
+      z-index: 6;
+    }
+    #onboard-tag  { left: 16px; top: 16px; }
+    /* External tag sits just below the divider so it's clearly anchored to
+     * the bottom viewport rather than floating in the upper one. */
+    #external-tag { left: 16px; top: calc(50vh + 12px); }
+    #note {
+      position: absolute; left: 50%; transform: translateX(-50%);
+      top: 16px;
+      font-family: "JetBrains Mono", monospace;
+      font-size: 11px;
+      color: var(--label-fg); background: var(--label-bg);
+      border: 0.5px solid var(--label-border);
+      border-radius: 3px;
+      padding: 5px 12px;
+      pointer-events: none;
+      z-index: 6;
+    }
+    #legend {
+      position: absolute; bottom: 16px; left: 16px;
+      font-family: "JetBrains Mono", monospace;
+      font-size: 11px;
+      color: var(--label-fg); background: var(--label-bg);
+      border: 0.5px solid var(--label-border);
+      border-radius: 6px;
+      padding: 8px 12px;
+      pointer-events: none;
+      letter-spacing: 0.02em;
+      line-height: 1.7;
+      z-index: 6;
+    }
+    #legend .row { display: flex; align-items: center; gap: 8px; }
+    #legend .swatch {
+      display: inline-block; width: 14px; height: 10px; border-radius: 2px;
+    }
+    #hint {
+      position: absolute; bottom: 18px; right: 56px;
+      font-family: "JetBrains Mono", monospace;
+      font-size: 10px;
+      color: var(--hud-unit);
+      pointer-events: none;
+      z-index: 6;
+    }
+  </style>
+</head>
+<body>
+  <div id="stage"></div>
+  <canvas id="onboard-overlay"></canvas>
+  <div id="split-divider"></div>
+  <div id="onboard-tag"  class="corner-tag"></div>
+  <div id="external-tag" class="corner-tag"></div>
+  <div id="note"></div>
+  <div id="legend"></div>
+  <div id="hint"></div>
+
+  <script type="module">
+    import * as THREE from 'three';
+    import { createEnvironment } from '/src/kit/Environment.js';
+    import { createDrone }       from '/src/kit/Quadrotor.js';
+    import { createTrail }       from '/src/kit/Trajectory.js';
+    import { createPanel }       from '/src/kit/Hud.js';
+    import { labels }            from '/src/kit/labels.js';
+    import { theme, mountThemeToggle, hexToCss } from '/src/kit/theme.js';
+
+    const L = labels.ch04.vio;
+    document.getElementById('note').textContent = L.note;
+    document.getElementById('hint').textContent = L.hint;
+    document.getElementById('onboard-tag').textContent  = L.onboardLabel;
+    document.getElementById('external-tag').textContent = L.externalLabel;
+
+    // ---------------------------------------------------------------------
+    // Scene. createEnvironment gives us the fog/floor/grid; we add the
+    // central pillar + a few smaller boxes to give the camera something
+    // structured to look at. Features live on box faces, on the ground, or
+    // float in space — varied so the optical flow has parallax depth cues.
+    // ---------------------------------------------------------------------
+    const stage = document.getElementById('stage');
+    const { scene, addLights, dispose: disposeEnv } = createEnvironment({
+      grid: true, fog: true, floor: true, sceneSize: 30, logoClouds: false,
+    });
+    addLights();
+    mountThemeToggle();
+
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+    renderer.setSize(stage.clientWidth, stage.clientHeight);
+    renderer.setScissorTest(true);
+    stage.appendChild(renderer.domElement);
+
+    // Two cameras, both sized to the (w × h/2) viewport aspect.
+    const externalCam = new THREE.PerspectiveCamera(50, 1, 0.1, 100);
+    const onboardCam  = new THREE.PerspectiveCamera(60, 1, 0.05, 50);
+    onboardCam.position.set(0, 0.08, 0.20);
+    // The kit drone's "forward" is local +z. The default camera looks along
+    // local -z, so rotate by π around Y to face the drone's heading.
+    onboardCam.rotation.y = Math.PI;
+
+    // ---------------------------------------------------------------------
+    // Landmarks: a central pillar the drone is "inspecting" + scattered
+    // smaller boxes for feature variety. Material uses the obstacle slot so
+    // boxes recede into the scene without competing with the bright feature
+    // dots.
+    // ---------------------------------------------------------------------
+    const boxMat = new THREE.MeshStandardMaterial({
+      color: theme.colors.obstacle, metalness: 0.05, roughness: 0.95,
+    });
+    const BOXES = [
+      { x:  0.0, y: 1.4, z:  0.0, w: 1.4, h: 2.8, d: 1.4 }, // central pillar
+      { x: -3.0, y: 0.6, z: -2.2, w: 1.2, h: 1.2, d: 1.2 },
+      { x:  3.4, y: 0.5, z:  2.0, w: 1.0, h: 1.0, d: 1.0 },
+      { x: -2.6, y: 0.4, z:  3.2, w: 0.9, h: 0.8, d: 0.9 },
+      { x:  2.4, y: 0.3, z: -3.0, w: 0.7, h: 0.6, d: 0.7 },
+    ];
+    const boxGeoms = [];
+    for (const b of BOXES) {
+      const g = new THREE.BoxGeometry(b.w, b.h, b.d);
+      const m = new THREE.Mesh(g, boxMat);
+      m.position.set(b.x, b.y, b.z);
+      scene.add(m);
+      boxGeoms.push(g);
+    }
+
+    // ---------------------------------------------------------------------
+    // Features. ~50 small bright unlit spheres scattered across the scene.
+    // MeshBasicMaterial so they read identically from both cameras and don't
+    // depend on the scene lighting rig.
+    // ---------------------------------------------------------------------
+    const FEATURE_COUNT = 50;
+    const features = [];
+    const featGeo = new THREE.SphereGeometry(0.10, 12, 8);
+
+    function pointOnBoxFace(b) {
+      const hw = b.w / 2, hh = b.h / 2, hd = b.d / 2;
+      const face = Math.floor(Math.random() * 5); // skip bottom face (face 2)
+      const u = (Math.random() - 0.5) * 1.8, v = (Math.random() - 0.5) * 1.8;
+      switch (face) {
+        case 0: return new THREE.Vector3(b.x - hw, b.y + u * hh / 2, b.z + v * hd / 2);
+        case 1: return new THREE.Vector3(b.x + hw, b.y + u * hh / 2, b.z + v * hd / 2);
+        case 2: return new THREE.Vector3(b.x + u * hw / 2, b.y + hh, b.z + v * hd / 2);
+        case 3: return new THREE.Vector3(b.x + u * hw / 2, b.y + v * hh / 2, b.z - hd);
+        case 4: return new THREE.Vector3(b.x + u * hw / 2, b.y + v * hh / 2, b.z + hd);
+      }
+    }
+
+    // Use a fixed seed-like pattern so the feature distribution is the same
+    // on every reload — easier to compare runs visually. (Math.random isn't
+    // truly seedable in vanilla JS; this sequence still varies between
+    // sessions but stays consistent within one.)
+    for (let i = 0; i < FEATURE_COUNT; i++) {
+      let pos;
+      const r = Math.random();
+      if (r < 0.55) {
+        // On a box face — most features cluster here, just like in real
+        // VIO scenes where corners and edges dominate.
+        pos = pointOnBoxFace(BOXES[Math.floor(Math.random() * BOXES.length)]);
+      } else if (r < 0.85) {
+        // On the ground.
+        pos = new THREE.Vector3(
+          (Math.random() - 0.5) * 14,
+          0.05,
+          (Math.random() - 0.5) * 14,
+        );
+      } else {
+        // Floating mid-air (e.g., representing a tag or banner).
+        pos = new THREE.Vector3(
+          (Math.random() - 0.5) * 10,
+          0.6 + Math.random() * 2.4,
+          (Math.random() - 0.5) * 10,
+        );
+      }
+      const baseColor = new THREE.Color().setHSL(
+        0.10 + Math.random() * 0.55, 0.65, 0.62,
+      );
+      const mat = new THREE.MeshBasicMaterial({ color: baseColor });
+      const mesh = new THREE.Mesh(featGeo, mat);
+      mesh.position.copy(pos);
+      scene.add(mesh);
+      features.push({
+        pos, baseColor, mesh,
+        state: 'active',     // 'active' | 'failing' | 'lost'
+        failProgress: 0,
+        track: [],           // recent (x, y) screen-space samples
+        lastSampleT: -1,
+      });
+    }
+
+    // ---------------------------------------------------------------------
+    // Drone. Orbits the central pillar at radius 5, altitude 1.8, always
+    // yawing inward — gives the onboard camera a continuous look at the
+    // pillar so features sweep horizontally across frame.
+    // ---------------------------------------------------------------------
+    const drone = createDrone({
+      scale: 0.85, accentColor: theme.colors.executed,
+    });
+    scene.add(drone.group);
+    drone.group.add(onboardCam);
+
+    const trail = createTrail({ maxPoints: 600, color: theme.colors.executed });
+    scene.add(trail.line);
+
+    const LOOP   = 20;
+    const RADIUS = 5;
+    const ALT    = 1.8;
+    const _pos = new THREE.Vector3();
+    const _heading = new THREE.Vector3();
+    const _target = new THREE.Vector3(0, ALT, 0);
+    function placeDrone(t) {
+      const a = (2 * Math.PI * t) / LOOP;
+      _pos.set(RADIUS * Math.cos(a), ALT, RADIUS * Math.sin(a));
+      drone.group.position.copy(_pos);
+      _heading.copy(_target).sub(_pos);
+      drone.group.rotation.y = Math.atan2(_heading.x, _heading.z);
+    }
+
+    // ---------------------------------------------------------------------
+    // Onboard overlay. DPR-scaled canvas pinned to the top half. We re-do
+    // the scaling on resize so dots/lines stay crisp.
+    // ---------------------------------------------------------------------
+    const overlay = document.getElementById('onboard-overlay');
+    const ocx = overlay.getContext('2d');
+    function sizeOverlay() {
+      const w = stage.clientWidth, h = stage.clientHeight;
+      const dpr = Math.min(devicePixelRatio || 1, 2);
+      overlay.width  = w * dpr;
+      overlay.height = (h / 2) * dpr;
+      overlay.style.width  = w + 'px';
+      overlay.style.height = (h / 2) + 'px';
+      ocx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    }
+    sizeOverlay();
+
+    // ---------------------------------------------------------------------
+    // HUD. Tracker stats top-right, legend bottom-left.
+    // ---------------------------------------------------------------------
+    const trackPanel = createPanel({
+      title: L.trackerPanel, corner: 'tr', color: 'green',
+      items: [
+        { key: 'tracked', label: L.tracked, value: '0 / 50' },
+        { key: 'lost',    label: L.lost,    value: '0' },
+        { key: 'reproj',  label: L.reproj,  value: '0.62', unit: 'px' },
+      ],
+    });
+    stage.appendChild(trackPanel.el);
+
+    const legend = document.getElementById('legend');
+    function legendRow(swatchCss, text) {
+      const row = document.createElement('div'); row.className = 'row';
+      const sw = document.createElement('span'); sw.className = 'swatch';
+      sw.style.background = swatchCss;
+      const tx = document.createElement('span'); tx.textContent = text;
+      row.appendChild(sw); row.appendChild(tx);
+      return row;
+    }
+    legend.appendChild(legendRow(hexToCss(theme.colors.perception), L.legendActive));
+    legend.appendChild(legendRow(hexToCss(theme.colors.executed),   L.legendFailing));
+    legend.appendChild(legendRow('rgba(220,225,235,0.55)',          L.legendFlow));
+
+    // ---------------------------------------------------------------------
+    // Sim state.
+    // ---------------------------------------------------------------------
+    let simT = 0;
+    let cycleT0 = performance.now() * 0.001;
+    function resetCycle() {
+      cycleT0 = performance.now() * 0.001;
+      simT = 0;
+      trail.clear();
+      for (const f of features) {
+        f.state = 'active';
+        f.failProgress = 0;
+        f.track.length = 0;
+        f.lastSampleT = -1;
+        f.mesh.visible = true;
+        f.mesh.material.color.copy(f.baseColor);
+      }
+    }
+
+    // Failure rolls. Aim for ~4–6 failures per 20 s loop. Random per-step
+    // probability tuned to ~0.005 / frame at 60 fps → ~6 / 20 s.
+    function rollFailures(dt) {
+      // Hold the first ~1 s clean so the audience can read the initial
+      // "all features tracked" state before things start going wrong.
+      if (simT < 1.5) return;
+      if (Math.random() > dt * 0.30) return;
+      const candidates = features.filter((f) => f.state === 'active');
+      if (candidates.length === 0) return;
+      candidates[Math.floor(Math.random() * candidates.length)].state = 'failing';
+    }
+
+    // ---------------------------------------------------------------------
+    // Render. Two passes per frame: external bottom, onboard top. Then the
+    // overlay redraws over the onboard viewport.
+    // ---------------------------------------------------------------------
+    const _ndc = new THREE.Vector3();
+    const TRACK_LEN  = 8;     // how many recent samples to draw as a polyline
+    const TRACK_HZ   = 24;    // samples per second
+    const FLOW_COL   = 'rgba(220, 225, 235, 0.55)';
+    const ACTIVE_COL = hexToCss(theme.colors.perception);
+    const FAIL_COL   = hexToCss(theme.colors.executed);
+
+    function drawOverlay(w, halfH) {
+      ocx.clearRect(0, 0, w, halfH);
+
+      // Reticle in the very center — gives the audience a spatial anchor
+      // for the camera principal point.
+      ocx.strokeStyle = 'rgba(220,225,235,0.18)';
+      ocx.lineWidth = 0.5;
+      const cx0 = w / 2, cy0 = halfH / 2;
+      ocx.beginPath();
+      ocx.moveTo(cx0 - 8, cy0); ocx.lineTo(cx0 + 8, cy0);
+      ocx.moveTo(cx0, cy0 - 8); ocx.lineTo(cx0, cy0 + 8);
+      ocx.stroke();
+
+      let trackedCount = 0;
+      for (const f of features) {
+        if (f.state === 'lost') continue;
+        _ndc.copy(f.pos).project(onboardCam);
+        const inFront = _ndc.z > -1 && _ndc.z < 1;
+        const inFOV = inFront && Math.abs(_ndc.x) <= 1 && Math.abs(_ndc.y) <= 1;
+        if (!inFOV) {
+          // Out of view — wipe the track so re-entries don't draw a long
+          // bogus line across the frame.
+          f.track.length = 0;
+          continue;
+        }
+        const sx = (_ndc.x + 1) * 0.5 * w;
+        const sy = (1 - _ndc.y) * 0.5 * halfH;
+
+        // Sample the track at TRACK_HZ so the polyline has visible spacing
+        // even at 60 fps (1-pixel-per-frame motion would read as a single
+        // dot instead of a flow vector).
+        if (simT - f.lastSampleT >= 1 / TRACK_HZ || f.lastSampleT < 0) {
+          f.track.push({ x: sx, y: sy });
+          if (f.track.length > TRACK_LEN) f.track.shift();
+          f.lastSampleT = simT;
+        }
+
+        // Draw polyline (oldest faint, newest bright).
+        if (f.track.length >= 2) {
+          ocx.lineWidth = 1.2;
+          for (let i = 1; i < f.track.length; i++) {
+            const alpha = 0.15 + 0.55 * (i / f.track.length);
+            ocx.strokeStyle = `rgba(220, 225, 235, ${alpha})`;
+            ocx.beginPath();
+            ocx.moveTo(f.track[i - 1].x, f.track[i - 1].y);
+            ocx.lineTo(f.track[i].x, f.track[i].y);
+            ocx.stroke();
+          }
+        }
+
+        // Current dot. Active = green, failing = magenta with halo pulse.
+        if (f.state === 'active') {
+          ocx.fillStyle = ACTIVE_COL;
+          ocx.beginPath(); ocx.arc(sx, sy, 4, 0, Math.PI * 2); ocx.fill();
+          ocx.strokeStyle = 'rgba(0,0,0,0.45)';
+          ocx.lineWidth = 0.5;
+          ocx.stroke();
+          trackedCount++;
+        } else if (f.state === 'failing') {
+          const pulse = 0.5 + 0.5 * Math.sin(f.failProgress * 25);
+          ocx.fillStyle = FAIL_COL;
+          ocx.beginPath(); ocx.arc(sx, sy, 4 + pulse * 2, 0, Math.PI * 2); ocx.fill();
+          ocx.strokeStyle = `rgba(255, 51, 102, ${pulse})`;
+          ocx.lineWidth = 1.2;
+          ocx.beginPath(); ocx.arc(sx, sy, 8 + pulse * 4, 0, Math.PI * 2); ocx.stroke();
+        }
+      }
+      return trackedCount;
+    }
+
+    // ---------------------------------------------------------------------
+    // Loop.
+    // ---------------------------------------------------------------------
+    const clock = new THREE.Clock();
+    (function tick() {
+      const dt = Math.min(0.05, clock.getDelta());
+      const now = performance.now() * 0.001;
+      simT = now - cycleT0;
+      if (simT >= LOOP) resetCycle();
+
+      placeDrone(simT);
+      drone.update(dt);
+      trail.push(drone.group.position);
+
+      // Feature failure progression.
+      rollFailures(dt);
+      for (const f of features) {
+        if (f.state === 'failing') {
+          f.failProgress += dt;
+          if (f.failProgress > 0.7) {
+            f.state = 'lost';
+            f.mesh.visible = false;
+          } else {
+            // 3D mesh blinks toward magenta in sync with the overlay halo.
+            const pulse = 0.5 + 0.5 * Math.sin(f.failProgress * 25);
+            f.mesh.material.color.lerpColors(f.baseColor,
+              new THREE.Color(0xff3366), 0.4 + pulse * 0.5);
+          }
+        }
+      }
+
+      const w = stage.clientWidth, h = stage.clientHeight;
+      const halfH = h / 2;
+      const aspect = w / halfH;
+
+      // External orbit.
+      const a = now * 0.10;
+      externalCam.position.set(Math.cos(a) * 12, 7.5, Math.sin(a) * 12);
+      externalCam.lookAt(0, 1.4, 0);
+      externalCam.aspect = aspect;
+      externalCam.updateProjectionMatrix();
+
+      onboardCam.aspect = aspect;
+      onboardCam.updateProjectionMatrix();
+
+      // Bottom: external. clear flag is implicit when scissor + clear are
+      // set. We need to autoClear off so the second render() doesn't wipe
+      // the first; instead we manually clear per viewport.
+      renderer.autoClear = false;
+      renderer.setViewport(0, 0, w, halfH);
+      renderer.setScissor(0, 0, w, halfH);
+      renderer.clear();
+      renderer.render(scene, externalCam);
+
+      // Top: onboard.
+      renderer.setViewport(0, halfH, w, halfH);
+      renderer.setScissor(0, halfH, w, halfH);
+      renderer.clear();
+      renderer.render(scene, onboardCam);
+
+      const trackedCount = drawOverlay(w, halfH);
+      const lostCount = features.filter((f) => f.state === 'lost').length;
+      trackPanel.setValue('tracked', `${trackedCount} / ${FEATURE_COUNT}`);
+      trackPanel.setValue('lost',    String(lostCount));
+      // Synthesised reprojection error — slowly varying so it reads as a
+      // live measurement rather than a frozen number. We don't actually
+      // run bundle adjustment here.
+      const reproj = 0.62 + 0.30 * Math.sin(simT * 0.65) + (Math.random() - 0.5) * 0.05;
+      trackPanel.setValue('reproj', reproj.toFixed(2));
+
+      requestAnimationFrame(tick);
+    })();
+
+    // ---------------------------------------------------------------------
+    // Resize + dispose.
+    // ---------------------------------------------------------------------
+    addEventListener('resize', () => {
+      const w = stage.clientWidth, h = stage.clientHeight;
+      renderer.setSize(w, h);
+      sizeOverlay();
+    });
+    addEventListener('beforeunload', () => {
+      drone.dispose(); trail.dispose();
+      featGeo.dispose();
+      for (const f of features) f.mesh.material.dispose();
+      for (const g of boxGeoms) g.dispose();
+      boxMat.dispose();
+      trackPanel.dispose();
+      disposeEnv(); renderer.dispose();
+    });
+  </script>
+</body>
+</html>
