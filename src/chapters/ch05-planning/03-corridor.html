@@ -1,0 +1,508 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Ch5 · 安全飞行走廊</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+SC:wght@300;400;500;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/src/kit/hud.css">
+  <style>
+    /* Safe Flight Corridor: a chain of overlapping convex polyhedra (we use
+     * axis-aligned boxes — the simplest convex set, exactly what tools like
+     * Decomp/IRIS produce in practice) inflated around a coarse front-end
+     * path. Each box is inflated outward face-by-face until it touches an
+     * obstacle, giving local "wiggle room" the back-end optimiser fills with
+     * a smooth trajectory. The whole pipeline runs offline at load — the
+     * timeline just replays the four stages. */
+
+    html, body { margin: 0; background: var(--stage-bg); color: var(--label-strong-fg);
+                 font-family: "Noto Sans SC", sans-serif; overflow: hidden; }
+
+    #note {
+      position: absolute; top: 24px; left: 50%; transform: translateX(-50%);
+      font-family: "JetBrains Mono", monospace;
+      font-size: 11px;
+      color: var(--label-fg);
+      background: var(--label-bg);
+      border: 0.5px solid var(--label-border);
+      border-radius: 3px;
+      padding: 5px 12px;
+      pointer-events: none;
+    }
+    #legend {
+      position: absolute; bottom: 16px; left: 16px;
+      font-family: "JetBrains Mono", monospace;
+      font-size: 11px;
+      color: var(--label-fg);
+      background: var(--label-bg);
+      border: 0.5px solid var(--label-border);
+      border-radius: 6px;
+      padding: 8px 12px;
+      pointer-events: none;
+      letter-spacing: 0.02em;
+      line-height: 1.7;
+    }
+    #legend .row { display: flex; align-items: center; gap: 8px; }
+    #legend .swatch {
+      display: inline-block; width: 14px; height: 10px; border-radius: 2px;
+      border: 0.5px solid var(--label-border);
+    }
+    #hint {
+      position: absolute; bottom: 16px; right: 56px;
+      font-family: "JetBrains Mono", monospace;
+      font-size: 10px;
+      color: var(--hud-unit);
+      pointer-events: none;
+    }
+  </style>
+</head>
+<body>
+  <div id="stage" style="position:relative;width:100vw;height:100vh"></div>
+  <div id="note"></div>
+  <div id="legend"></div>
+  <div id="hint"></div>
+
+  <script type="module">
+    import * as THREE from 'three';
+    import { createEnvironment } from '/src/kit/Environment.js';
+    import { createDrone }       from '/src/kit/Quadrotor.js';
+    import { createTrail }       from '/src/kit/Trajectory.js';
+    import { createPanel }       from '/src/kit/Hud.js';
+    import { labels }            from '/src/kit/labels.js';
+    import { theme, mountThemeToggle, hexToCss } from '/src/kit/theme.js';
+
+    const L = labels.ch05.corridor;
+    document.getElementById('note').textContent = L.note;
+    document.getElementById('hint').textContent = L.hintBL;
+
+    // --- Obstacles + waypoints ------------------------------------------
+    // Three slab obstacles in a row at z ≈ 0; the front-end path threads the
+    // gaps by alternating z-side, so adjacent corridor boxes overlap and the
+    // smoother has a continuous tube to live in. (The original layout had
+    // wide gaps between waypoints — corridor boxes there could not touch
+    // each other, so any smoothing slipped back into obstacles.)
+    const OBSTACLES = [
+      { x0: -3.2, x1: -2.4, y0: 0.0, y1: 3.5, z0: -1.0, z1: 1.0 },
+      { x0: -0.4, x1:  0.4, y0: 0.0, y1: 3.5, z0: -1.0, z1: 1.0 },
+      { x0:  2.4, x1:  3.2, y0: 0.0, y1: 3.5, z0: -1.0, z1: 1.0 },
+    ];
+
+    // Coarse front-end path. Already obstacle-free but kinked — exactly what
+    // an A*-style discrete planner spits out. The corridor + smoother polish
+    // it into something dynamically feasible. Waypoints are spaced ≤ 1.6 m
+    // apart so each corridor box overlaps its neighbours.
+    const WAYPOINTS = [
+      new THREE.Vector3(-5.0, 1.5,  0.0),
+      new THREE.Vector3(-3.6, 1.5,  1.9),
+      new THREE.Vector3(-2.0, 1.5,  1.9),
+      new THREE.Vector3(-1.4, 1.5,  0.0),
+      new THREE.Vector3(-0.8, 1.5, -1.9),
+      new THREE.Vector3( 0.8, 1.5, -1.9),
+      new THREE.Vector3( 1.4, 1.5,  0.0),
+      new THREE.Vector3( 2.0, 1.5,  1.9),
+      new THREE.Vector3( 3.6, 1.5,  1.9),
+      new THREE.Vector3( 5.0, 1.5,  0.0),
+    ];
+
+    // --- Box inflation --------------------------------------------------
+    // Greedy face-by-face growth. At each iteration we try to grow each of
+    // the six faces by STEP; we revert any face whose growth would push the
+    // box into an obstacle (or below the floor). Ordering effects matter —
+    // we randomise the face order inside each pass so no axis is starved.
+    function inflateBox(c, obstacles, { maxR = 3.5, step = 0.05 } = {}) {
+      // Box dimensions are stored as offsets from centre.
+      let x0 = -0.05, x1 = 0.05, y0 = -0.05, y1 = 0.05, z0 = -0.05, z1 = 0.05;
+      const collides = () =>
+        obstacles.some((o) =>
+          (c.x + x0 < o.x1 && c.x + x1 > o.x0) &&
+          (c.y + y0 < o.y1 && c.y + y1 > o.y0) &&
+          (c.z + z0 < o.z1 && c.z + z1 > o.z0));
+      // Refuse to start with a collision — happens if a waypoint is right at
+      // an obstacle face. In practice the front-end keeps clear.
+      if (collides()) return { x0, x1, y0, y1, z0, z1 };
+
+      let grew = true, iters = 0;
+      while (grew && iters < 400) {
+        grew = false;
+        const order = [0,1,2,3,4,5].sort(() => Math.random() - 0.5);
+        for (const f of order) {
+          const before = [x0, x1, y0, y1, z0, z1];
+          if (f === 0 && -x0 < maxR) x0 -= step;
+          else if (f === 1 && x1 < maxR) x1 += step;
+          else if (f === 2 && c.y + y0 - step > 0.05 && -y0 < maxR) y0 -= step;
+          else if (f === 3 && y1 < maxR) y1 += step;
+          else if (f === 4 && -z0 < maxR) z0 -= step;
+          else if (f === 5 && z1 < maxR) z1 += step;
+          else continue;
+          if (collides()) {
+            [x0, x1, y0, y1, z0, z1] = before;
+          } else {
+            grew = true;
+          }
+        }
+        iters++;
+      }
+      return { x0, x1, y0, y1, z0, z1 };
+    }
+
+    const CORRIDOR = WAYPOINTS.map((w) => ({
+      center: w,
+      bounds: inflateBox(w, OBSTACLES, { maxR: 1.5, step: 0.05 }),
+    }));
+
+    // World-space AABB for a corridor box. Used by the in-corridor smoother
+    // and the connectivity check below.
+    function boxAABB(c) {
+      return {
+        x0: c.center.x + c.bounds.x0, x1: c.center.x + c.bounds.x1,
+        y0: c.center.y + c.bounds.y0, y1: c.center.y + c.bounds.y1,
+        z0: c.center.z + c.bounds.z0, z1: c.center.z + c.bounds.z1,
+      };
+    }
+    function aabbOverlapCenter(a, b) {
+      const x0 = Math.max(a.x0, b.x0), x1 = Math.min(a.x1, b.x1);
+      const y0 = Math.max(a.y0, b.y0), y1 = Math.min(a.y1, b.y1);
+      const z0 = Math.max(a.z0, b.z0), z1 = Math.min(a.z1, b.z1);
+      if (x0 > x1 || y0 > y1 || z0 > z1) return null;
+      return new THREE.Vector3((x0+x1)/2, (y0+y1)/2, (z0+z1)/2);
+    }
+    function pointInAABB(p, a) {
+      return p.x >= a.x0 && p.x <= a.x1 &&
+             p.y >= a.y0 && p.y <= a.y1 &&
+             p.z >= a.z0 && p.z <= a.z1;
+    }
+    function clampToAABB(p, a) {
+      return new THREE.Vector3(
+        Math.min(a.x1, Math.max(a.x0, p.x)),
+        Math.min(a.y1, Math.max(a.y0, p.y)),
+        Math.min(a.z1, Math.max(a.z0, p.z)),
+      );
+    }
+    const CORRIDOR_AABBS = CORRIDOR.map(boxAABB);
+
+    // Project a point to the union of corridor AABBs. If the point is
+    // already inside any box → identity; otherwise pick the closest face
+    // projection across all boxes. Used as a hard safety net so the smooth
+    // curve we hand the drone never escapes the corridor.
+    function projectToCorridor(p) {
+      for (const a of CORRIDOR_AABBS) if (pointInAABB(p, a)) return p;
+      let best = null, bestD = Infinity;
+      for (const a of CORRIDOR_AABBS) {
+        const cp = clampToAABB(p, a);
+        const d = p.distanceTo(cp);
+        if (d < bestD) { bestD = d; best = cp; }
+      }
+      return best;
+    }
+
+    // --- Scene ----------------------------------------------------------
+    const stage = document.getElementById('stage');
+    const { scene, addLights, dispose: disposeEnv } = createEnvironment({
+      grid: true, fog: true, floor: true, sceneSize: 30, logoClouds: false,
+    });
+    addLights();
+    mountThemeToggle();
+
+    const camera = new THREE.PerspectiveCamera(46, stage.clientWidth / stage.clientHeight, 0.1, 80);
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+    renderer.setSize(stage.clientWidth, stage.clientHeight);
+    stage.appendChild(renderer.domElement);
+
+    // Obstacles.
+    const obsMat = new THREE.MeshStandardMaterial({
+      color: theme.colors.obstacle, metalness: 0.05, roughness: 0.95,
+    });
+    const obsMeshes = [];
+    for (const o of OBSTACLES) {
+      const w = o.x1 - o.x0, h = o.y1 - o.y0, d = o.z1 - o.z0;
+      const geo = new THREE.BoxGeometry(w, h, d);
+      const mesh = new THREE.Mesh(geo, obsMat);
+      mesh.position.set((o.x0 + o.x1)/2, (o.y0 + o.y1)/2, (o.z0 + o.z1)/2);
+      scene.add(mesh);
+      obsMeshes.push({ mesh, geo });
+    }
+
+    // Initial polyline (kinked) through waypoints — the "front-end" output.
+    const initGeo = new THREE.BufferGeometry().setFromPoints(WAYPOINTS);
+    const initMat = new THREE.LineBasicMaterial({
+      color: theme.colors.executed, transparent: true, opacity: 0.8,
+    });
+    const initLine = new THREE.Line(initGeo, initMat);
+    scene.add(initLine);
+
+    // Waypoint markers.
+    const wpGeo = new THREE.SphereGeometry(0.13, 16, 12);
+    const wpMat = new THREE.MeshStandardMaterial({
+      color: theme.colors.waypoint, emissive: theme.colors.waypoint, emissiveIntensity: 0.3,
+    });
+    const wpGroup = new THREE.Group();
+    for (const w of WAYPOINTS) {
+      const m = new THREE.Mesh(wpGeo, wpMat);
+      m.position.copy(w);
+      wpGroup.add(m);
+    }
+    scene.add(wpGroup);
+
+    // --- Corridor boxes -------------------------------------------------
+    // Two materials per box: a translucent fill and a wireframe edge. Both
+    // use the perception slot (semantic "safe / sensed / known clear"), which
+    // matches the manual's typical SFC visualisation in green.
+    const corrFillMat = new THREE.MeshBasicMaterial({
+      color: theme.colors.perception, transparent: true, opacity: 0.10, side: THREE.DoubleSide,
+      depthWrite: false,
+    });
+    const corrEdgeMat = new THREE.LineBasicMaterial({
+      color: theme.colors.perception, transparent: true, opacity: 0.85,
+    });
+    const corrBoxes = [];
+    for (const c of CORRIDOR) {
+      const w = c.bounds.x1 - c.bounds.x0;
+      const h = c.bounds.y1 - c.bounds.y0;
+      const d = c.bounds.z1 - c.bounds.z0;
+      const cx = c.center.x + (c.bounds.x0 + c.bounds.x1) / 2;
+      const cy = c.center.y + (c.bounds.y0 + c.bounds.y1) / 2;
+      const cz = c.center.z + (c.bounds.z0 + c.bounds.z1) / 2;
+      const geo = new THREE.BoxGeometry(w, h, d);
+      const fill = new THREE.Mesh(geo, corrFillMat);
+      fill.position.set(cx, cy, cz);
+      fill.scale.setScalar(0.001); // hidden until stage 2 reveals
+      const edges = new THREE.LineSegments(new THREE.EdgesGeometry(geo), corrEdgeMat);
+      edges.position.copy(fill.position);
+      edges.scale.setScalar(0.001);
+      scene.add(fill); scene.add(edges);
+      corrBoxes.push({ fill, edges, geo, edgesGeo: edges.geometry, target: { w, h, d } });
+    }
+
+    // --- Smoothed trajectory --------------------------------------------
+    // Stage 3's whole point: the new trajectory must stay inside the
+    // corridor. Catmull-Rom through just the waypoints overshoots into
+    // obstacles at sharp turns, so we (a) densify by inserting the centre
+    // of each adjacent box overlap as a transit waypoint, then (b) project
+    // every sample onto the corridor union as a hard safety net.
+    const denseWaypoints = [WAYPOINTS[0].clone()];
+    for (let i = 0; i < CORRIDOR.length - 1; i++) {
+      const mid = aabbOverlapCenter(CORRIDOR_AABBS[i], CORRIDOR_AABBS[i+1]);
+      if (mid) denseWaypoints.push(mid);
+      denseWaypoints.push(WAYPOINTS[i+1].clone());
+    }
+    const smoothCurve = new THREE.CatmullRomCurve3(denseWaypoints, false, 'catmullrom', 0.3);
+    const SMOOTH_SAMPLES = 480;
+    const smoothPts = [];
+    for (let i = 0; i <= SMOOTH_SAMPLES; i++) {
+      const u = i / SMOOTH_SAMPLES;
+      smoothPts.push(projectToCorridor(smoothCurve.getPoint(u)));
+    }
+    // Cache an arc-length parameterisation so the drone advances at uniform
+    // speed regardless of how the projection redistributes samples.
+    const smoothCum = new Float32Array(smoothPts.length);
+    for (let i = 1; i < smoothPts.length; i++) {
+      smoothCum[i] = smoothCum[i-1] + smoothPts[i].distanceTo(smoothPts[i-1]);
+    }
+    const smoothLen = smoothCum[smoothCum.length - 1];
+    function pointAtArc(s) {
+      // Binary search smoothCum for the closest arc-length, then lerp.
+      let lo = 0, hi = smoothCum.length - 1;
+      while (lo < hi) {
+        const m = (lo + hi) >> 1;
+        if (smoothCum[m] < s) lo = m + 1; else hi = m;
+      }
+      const i = Math.max(1, lo);
+      const u = (s - smoothCum[i-1]) / Math.max(1e-6, smoothCum[i] - smoothCum[i-1]);
+      return smoothPts[i-1].clone().lerp(smoothPts[i], u);
+    }
+
+    const smoothGeo = new THREE.BufferGeometry().setFromPoints(smoothPts);
+    const smoothMat = new THREE.LineBasicMaterial({
+      color: theme.colors.planning, transparent: true, opacity: 0.95,
+    });
+    const smoothLine = new THREE.Line(smoothGeo, smoothMat);
+    smoothLine.material.opacity = 0;  // shown in stage 3
+    scene.add(smoothLine);
+
+    // --- Drone + trail --------------------------------------------------
+    const drone = createDrone({ scale: 0.85, accentColor: theme.colors.executed, showThrustVector: false });
+    drone.group.position.copy(WAYPOINTS[0]);
+    scene.add(drone.group);
+    const trail = createTrail({ maxPoints: 600, color: theme.colors.executed });
+    scene.add(trail.line);
+
+    // --- HUD ------------------------------------------------------------
+    const stagePanel = createPanel({
+      title: L.stagePanel, corner: 'tl', color: 'cyan',
+      items: [
+        { key: 'stage', label: '', value: L.stage1 },
+      ],
+    });
+    stage.appendChild(stagePanel.el);
+
+    // Min clearance: smallest face-to-obstacle distance across all corridor
+    // boxes — a single number that summarises how tight the corridor squeezes
+    // through the obstacle field.
+    function minClearance() {
+      let m = Infinity;
+      for (const c of CORRIDOR) {
+        const b = c.bounds;
+        const halves = [-b.x0, b.x1, -b.y0, b.y1, -b.z0, b.z1];
+        m = Math.min(m, Math.min(...halves));
+      }
+      return m;
+    }
+    const statsPanel = createPanel({
+      title: L.statsPanel, corner: 'tr', color: 'magenta',
+      items: [
+        { key: 'boxes', label: L.boxCount, value: '0' },
+        { key: 'clear', label: L.minClear, value: minClearance().toFixed(2), unit: 'm' },
+      ],
+    });
+    stage.appendChild(statsPanel.el);
+
+    // Legend.
+    const legend = document.getElementById('legend');
+    function legendRow(swatchCss, text) {
+      const row = document.createElement('div'); row.className = 'row';
+      const sw = document.createElement('span'); sw.className = 'swatch';
+      sw.style.background = swatchCss;
+      const tx = document.createElement('span'); tx.textContent = text;
+      row.appendChild(sw); row.appendChild(tx);
+      return row;
+    }
+    legend.appendChild(legendRow(hexToCss(theme.colors.executed),   L.legendInit));
+    legend.appendChild(legendRow(hexToCss(theme.colors.perception), L.legendCorr));
+    legend.appendChild(legendRow(hexToCss(theme.colors.planning),   L.legendSmooth));
+
+    // --- Stage machine --------------------------------------------------
+    // 0..4   stage 1: initial polyline visible, no corridor
+    // 4..10  stage 2: corridor boxes inflate one by one along the path
+    // 10..14 stage 3: corridor stays, smoothed trajectory draws in
+    // 14..22 stage 4: drone flies smoothed trajectory
+    // 22..24 fade everything but boxes, reset for next loop
+    const T = { s1End: 4, s2End: 10, s3End: 14, s4End: 22, fadeEnd: 24 };
+    const LOOP = T.fadeEnd;
+    const FLIGHT_TIME = T.s4End - T.s3End;  // 8 s flight
+    let loopT0 = performance.now() * 0.001;
+    let lastFlightU = -1;
+
+    function setBoxScale(box, u) {
+      const s = Math.max(0.001, u);
+      box.fill.scale.set(box.target.w === 0 ? 0.001 : s,
+                         box.target.h === 0 ? 0.001 : s,
+                         box.target.d === 0 ? 0.001 : s);
+      box.edges.scale.copy(box.fill.scale);
+    }
+    function smoothstep(u) { return Math.max(0, Math.min(1, u*u*(3 - 2*u))); }
+
+    // --- Loop -----------------------------------------------------------
+    const clock = new THREE.Clock();
+    (function tick() {
+      const dt = Math.min(0.05, clock.getDelta());
+      const now = performance.now() * 0.001;
+      const t = (now - loopT0) % LOOP;
+
+      // Stage transitions are visual; HUD label updated once per stage.
+      if (t < T.s1End) {
+        stagePanel.setValue('stage', L.stage1);
+        // Initial line bright; everything else hidden.
+        initLine.material.opacity = 0.9;
+        for (const b of corrBoxes) setBoxScale(b, 0);
+        smoothLine.material.opacity = 0;
+        statsPanel.setValue('boxes', '0');
+        drone.group.position.copy(WAYPOINTS[0]);
+        trail.clear(); lastFlightU = -1;
+      } else if (t < T.s2End) {
+        stagePanel.setValue('stage', L.stage2);
+        // Inflate boxes in sequence. Each box gets its own time slice with
+        // a smoothstep so adjacent boxes appear as a flowing wave.
+        const u = (t - T.s1End) / (T.s2End - T.s1End);
+        const N = corrBoxes.length;
+        let visible = 0;
+        for (let i = 0; i < N; i++) {
+          const startU = i / N * 0.85;            // last box finishes at u=0.85
+          const endU   = startU + 0.30;
+          const lu = (u - startU) / (endU - startU);
+          const s = smoothstep(Math.min(1, Math.max(0, lu)));
+          setBoxScale(corrBoxes[i], s);
+          if (s > 0.5) visible++;
+        }
+        statsPanel.setValue('boxes', String(visible));
+        smoothLine.material.opacity = 0;
+        initLine.material.opacity = 0.85;
+      } else if (t < T.s3End) {
+        stagePanel.setValue('stage', L.stage3);
+        // Boxes fully shown; smooth line draws in.
+        for (const b of corrBoxes) setBoxScale(b, 1);
+        statsPanel.setValue('boxes', String(corrBoxes.length));
+        const u = (t - T.s2End) / (T.s3End - T.s2End);
+        smoothLine.material.opacity = 0.95;
+        smoothLine.geometry.setDrawRange(0, Math.max(2, Math.floor(u * smoothPts.length)));
+        // Initial polyline fades back as the new plan supersedes it.
+        initLine.material.opacity = 0.85 - 0.6 * u;
+      } else if (t < T.s4End) {
+        stagePanel.setValue('stage', L.stage4);
+        // Drone flies the corridor-bound smoothed trajectory. Defensively
+        // pin every visible piece — makes the chapter robust when navigated
+        // to mid-loop.
+        for (const b of corrBoxes) setBoxScale(b, 1);
+        statsPanel.setValue('boxes', String(corrBoxes.length));
+        smoothLine.geometry.setDrawRange(0, smoothPts.length);
+        smoothLine.material.opacity = 0.95;
+        initLine.material.opacity = 0.18;
+        const u = (t - T.s3End) / FLIGHT_TIME;
+        const p = pointAtArc(Math.min(smoothLen, u * smoothLen));
+        drone.group.position.copy(p);
+        const pAhead = pointAtArc(Math.min(smoothLen, (u + 0.01) * smoothLen));
+        const dx = pAhead.x - p.x, dz = pAhead.z - p.z;
+        if (Math.hypot(dx, dz) > 1e-4) drone.group.rotation.y = Math.atan2(dx, dz);
+        drone.update(dt);
+        if (u > 0 && u < 1 && u - lastFlightU > 0.005) trail.push(p);
+        lastFlightU = u;
+      } else {
+        // Fade the smoothed line + initial line; corridor stays as the
+        // "memorable" structure the audience is meant to leave with.
+        const u = (t - T.s4End) / (T.fadeEnd - T.s4End);
+        smoothLine.material.opacity = 0.95 * (1 - u);
+        initLine.material.opacity   = 0.18  * (1 - u);
+        if (u > 0.95) {
+          // Reset for next loop.
+          smoothLine.geometry.setDrawRange(0, 0);
+          smoothLine.material.opacity = 0;
+          initLine.material.opacity   = 0.9;
+          for (const b of corrBoxes) setBoxScale(b, 0);
+          drone.group.position.copy(WAYPOINTS[0]);
+          trail.clear();
+        }
+      }
+
+      // Slow orbit around the centre of the workspace.
+      const a = now * 0.10;
+      const r = 16, h = 7;
+      camera.position.set(Math.cos(a) * r, h, Math.sin(a) * r);
+      camera.lookAt(0, 2, 0);
+
+      renderer.render(scene, camera);
+      requestAnimationFrame(tick);
+    })();
+
+    // --- Resize + dispose -----------------------------------------------
+    addEventListener('resize', () => {
+      camera.aspect = stage.clientWidth / stage.clientHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(stage.clientWidth, stage.clientHeight);
+    });
+    addEventListener('beforeunload', () => {
+      drone.dispose(); trail.dispose();
+      for (const o of obsMeshes) o.geo.dispose();
+      obsMat.dispose();
+      wpGeo.dispose(); wpMat.dispose();
+      initGeo.dispose(); initMat.dispose();
+      smoothGeo.dispose(); smoothMat.dispose();
+      for (const b of corrBoxes) { b.geo.dispose(); b.edgesGeo.dispose(); }
+      corrFillMat.dispose(); corrEdgeMat.dispose();
+      stagePanel.dispose(); statsPanel.dispose();
+      disposeEnv(); renderer.dispose();
+    });
+  </script>
+</body>
+</html>
