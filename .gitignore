@@ -46,3 +46,10 @@ dist/
 *.log
 npm-debug.log*
 .DS_Store
+
+# ---------------------------
+# Recording output
+# ---------------------------
+out/
+# Stray frame buffers if the driver is interrupted mid-clip
+tools/record/_frames/

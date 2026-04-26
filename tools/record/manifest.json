@@ -1,0 +1,55 @@
+[
+  { "slug": "ch01-overview/01-stack" },
+  { "slug": "ch01-overview/02-frequency" },
+  { "slug": "ch01-overview/03-coupling" },
+
+  { "slug": "ch02-hardware/01-exploded",
+    "variants": [
+      { "name": "assembled" },
+      { "name": "exploded", "click": "#stage" }
+    ]
+  },
+  { "slug": "ch02-hardware/02-imu-vibration" },
+
+  { "slug": "ch03-control/01-underactuation", "duration": 13 },
+  { "slug": "ch03-control/02-pid-step",
+    "duration": 8,
+    "variants": [
+      { "name": "p",   "click": "#presetP"   },
+      { "name": "pd",  "click": "#presetPD"  },
+      { "name": "pid", "click": "#presetPID" }
+    ]
+  },
+  { "slug": "ch03-control/03-se3" },
+
+  { "slug": "ch04-estimation/01-imu-drift" },
+  { "slug": "ch04-estimation/02-vio" },
+
+  { "slug": "ch05-planning/01-search" },
+  { "slug": "ch05-planning/02-min-snap" },
+  { "slug": "ch05-planning/03-corridor" },
+
+  { "slug": "ch06-perception/01-occupancy" },
+  { "slug": "ch06-perception/02-orb" },
+  { "slug": "ch06-perception/03-yolo" },
+
+  { "slug": "ch07-swarm/01-reynolds",
+    "duration": 10,
+    "variants": [
+      { "name": "balanced", "click": "[data-preset='balanced']" },
+      { "name": "sep",      "click": "[data-preset='sep']"      },
+      { "name": "ali",      "click": "[data-preset='ali']"      },
+      { "name": "coh",      "click": "[data-preset='coh']"      }
+    ]
+  },
+  { "slug": "ch07-swarm/02-formation",
+    "duration": 10,
+    "variants": [
+      { "name": "diamond", "click": "[data-shape='diamond']" },
+      { "name": "line",    "click": "[data-shape='line']"    },
+      { "name": "grid",    "click": "[data-shape='grid']"    }
+    ]
+  },
+
+  { "slug": "ch08-learning/01-pixels-to-action" }
+]

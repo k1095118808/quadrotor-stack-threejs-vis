@@ -28,6 +28,7 @@ The complete animation inventory, priorities, and per-animation specs live in `P
 drone-autonomy-viz/
 ├── CLAUDE.md                  ← you are here
 ├── PROJECT_PLAN.md            ← full roadmap, specs, priorities
+├── README.md                  ← public-facing project overview
 ├── package.json
 ├── vite.config.js
 ├── index.html                 ← dev gallery: links to every animation
@@ -48,6 +49,14 @@ drone-autonomy-viz/
 │       │   └── 03-coupling.html
 │       ├── ch02-hardware/
 │       └── … ch03–ch08
+├── tools/
+│   └── record/                ← deterministic video export pipeline
+│       ├── recorder-shim.js   ← page-side clock/rAF override
+│       ├── record.mjs         ← Playwright driver
+│       ├── manifest.json      ← per-animation duration/fps/click variants
+│       └── README.md
+├── out/
+│   └── videos/                ← generated MP4s (gitignored)
 └── public/
     └── assets/                ← models, textures, (optional) icons
 ```
@@ -299,6 +308,20 @@ every page mounts via `mountThemeToggle()`. Design notes:
 - **Build the kit before any chapter work.** `PROJECT_PLAN.md` phase 1 is blocking.
 - **Screenshot for feedback.** When iterating on an animation's look, run it, take a screenshot, paste it into the chat with a natural-language change request. This is far faster than text-only description.
 - **Test in Chrome first**, then spot-check in Safari/Firefox before shipping.
+
+## Recording videos
+
+`npm run record` captures every animation to MP4 (deterministic frame stepping
++ Playwright screenshot of `#stage`, so HUD overlays *and* canvas land in the
+output). Defaults: 30 fps, 12 s, 1920×1080, both themes, 2 workers. Common
+overrides: `--only=<slug-substring>`, `--theme=dark|light`, `--workers=N`,
+`--fps=60`, `--duration=N`. Output goes to `out/videos/` (gitignored).
+
+When adding a new animation, append it to `tools/record/manifest.json`. If the
+scene has button presets that should each get their own clip, add a `variants`
+array — each entry's `click` selector is dispatched once before recording the
+clip's frames. See `tools/record/README.md` for the manifest schema and the
+clock-shim architecture.
 
 ## When in doubt
 
