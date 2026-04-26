@@ -447,6 +447,43 @@ export const labels = {
       hint:          '8 机 · 点击切换编队形状',
     },
   },
+  ch08: {
+    pixelsTitle: '像素到动作',
+    pixels: {
+      // P1. Schematic of an end-to-end policy: drone navigates a small
+      // obstacle field via a scripted potential-field controller; its
+      // actual command is what the action bars show. The intermediate
+      // "conv" / "fc" activations are real responses (Sobel + Laplacian
+      // edge maps) computed on the live onboard pixel buffer, so they
+      // react to what the camera sees — but they don't drive the drone.
+      // The note below is the honesty disclaimer.
+      feedTag:       '机载相机 · 32×24',
+      modelTag:      '策略网络 · 端到端 · 示意',
+      actionPanel:   '当前动作',
+      statsPanel:    '推理',
+      inferRate:     '推理频率',
+      paramCount:    '参数量',
+      // Action heads — high-level body-frame velocity command + yaw rate,
+      // which is the standard interface for vision-based RL drone policies
+      // (more honest than pretending to output rotor torques directly).
+      actVz:         'v_z · 升降',
+      actVx:         'v_x · 前进',
+      actVy:         'v_y · 横移',
+      actYaw:        'ω_ψ · 偏航',
+      // Layer captions — drawn under each block on the schematic.
+      layerInput:    '观测 · 32×24',
+      layerConv1:    '卷积 1 · 4 通道',
+      layerConv2:    '卷积 2 · 8 通道',
+      layerFc:       '全连接 · 32',
+      layerAction:   '动作头 · 4',
+      goalLabel:     '目标',
+      legendObs:     '观测灰度',
+      legendAct:     '激活强度',
+      legendAction:  '动作命令',
+      note:          '示意网络 · 真实端到端策略训练自仿真器, 此处推理由脚本生成',
+      hint:          '观测 → 网络 → 动作 · 自动循环',
+    },
+  },
   demo: {
     // Strings used only by src/kit-demo.html (Phase 0 acceptance test).
     title:     '工具包演示',
