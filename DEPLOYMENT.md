@@ -84,16 +84,41 @@ GitHub Actions**. Push to `main` and the workflow publishes.
 If you map a custom domain (CNAME), set `VITE_BASE=/` and add a `CNAME`
 file in `public/`.
 
-### 3b. Cloudflare Pages
+### 3b. Cloudflare (Workers Builds or Pages)
 
-Connect the repo via the Cloudflare dashboard, set:
+Cloudflare is migrating new accounts from Pages to **Workers Builds**, a
+unified platform where static-only sites are deployed as Workers with a
+static-assets binding. The repo ships a `wrangler.jsonc` that handles
+this mode — no Worker code, just the asset upload — so the same config
+covers both flows.
 
-- **Build command:** `npm run build`
-- **Build output:** `dist`
-- **Environment variable:** `NODE_VERSION = 20`
+**Workers Builds (newer dashboard)** — Workers & Pages → Create →
+Connect to Git → pick the repo, then:
 
-That's it — no `base` change needed (Pages serves from the apex).
-Cloudflare's CDN compresses Three.js (≈600 KB) to ~150 KB gzip, and
+| Field | Value |
+|---|---|
+| Project name | `quadrotor-stack-vis` (must match `name` in `wrangler.jsonc`) |
+| Build command | `npm run build` |
+| Deploy command | `npx wrangler deploy` |
+| Non-production branch deploy command | `npx wrangler versions upload` |
+| Path | `/` |
+| Environment variable | `NODE_VERSION = 20` |
+
+The Cloudflare Worker token is created automatically. Save & Deploy →
+~60 s build → live at `https://quadrotor-stack-vis.<account>.workers.dev`.
+
+**Cloudflare Pages (older dashboard)** — Workers & Pages → Create → Pages
+tab → Connect to Git, then:
+
+- Build command: `npm run build`
+- Build output directory: `dist`
+- Environment variable: `NODE_VERSION = 20`
+
+`wrangler.jsonc` is ignored by the Pages flow — both paths produce the
+same `dist/` artifact and serve it the same way at the edge.
+
+No `base` change needed for either — both serve from the apex.
+Cloudflare's CDN compresses Three.js (~600 KB) to ~150 KB gzip and
 geo-distributes the static bundle.
 
 ### 3c. Vercel

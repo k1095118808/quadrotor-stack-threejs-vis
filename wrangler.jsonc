@@ -1,0 +1,18 @@
+// Cloudflare Workers configuration for static-asset-only deployment.
+// `wrangler deploy` reads this file, uploads everything under
+// `assets.directory` to Cloudflare's edge, and serves it under the
+// Worker's *.workers.dev (or custom-domain) hostname. No Worker JS is
+// involved — this is the same outcome as Cloudflare Pages, just on the
+// Workers Builds platform that newer dashboard accounts are routed to.
+//
+// Local deploy: npm run build && npx wrangler deploy
+// CI deploy:    handled by Cloudflare Workers Builds (matches the
+//               "Deploy command" field in the project settings).
+{
+  "$schema": "https://json.schemastore.org/wrangler.json",
+  "name": "quadrotor-stack-vis",
+  "compatibility_date": "2025-04-01",
+  "assets": {
+    "directory": "./dist"
+  }
+}
