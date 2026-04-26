@@ -1,0 +1,812 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Ch8 · 像素到动作</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+SC:wght@300;400;500;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/src/kit/hud.css">
+  <style>
+    /* Pixels-to-action: top half of the stage holds a 3-D world where a
+     * drone navigates obstacles toward cycling goal beacons; bottom half
+     * is an overlay canvas that draws the policy network as a schematic
+     * pipeline (input pixel grid → conv1 → conv2 → fc → action bars).
+     *
+     * Honesty: the drone is steered by a scripted potential-field
+     * controller. The bars on the right show that scripted command. The
+     * intermediate "conv" / "fc" activations are real responses (Sobel +
+     * Laplacian + fixed random projections) computed on the live onboard
+     * pixel buffer, so the maps light up in places where the camera sees
+     * structure — but they don't drive the drone. The footer note says so. */
+
+    html, body { margin: 0; background: var(--stage-bg); color: var(--label-strong-fg);
+                 font-family: "Noto Sans SC", sans-serif; overflow: hidden; }
+    #stage { position: relative; width: 100vw; height: 100vh; }
+    #overlay {
+      position: absolute; left: 0; top: 0; width: 100vw; height: 100vh;
+      pointer-events: none; z-index: 5;
+    }
+    .corner-tag {
+      position: absolute; padding: 4px 9px;
+      font-family: "JetBrains Mono", monospace;
+      font-size: 10px;
+      color: var(--label-fg); background: var(--label-bg);
+      border: 0.5px solid var(--label-border);
+      border-radius: 3px;
+      letter-spacing: 0.05em;
+      pointer-events: none;
+      text-transform: uppercase;
+      z-index: 7;
+    }
+    #feed-tag  { left: 16px; top: 16px; }
+    #model-tag { left: 50%; transform: translateX(-50%); top: 16px; }
+    #note {
+      position: absolute; left: 50%; transform: translateX(-50%);
+      bottom: 12px;
+      font-family: "JetBrains Mono", monospace;
+      font-size: 11px;
+      color: var(--label-fg); background: var(--label-bg);
+      border: 0.5px solid var(--label-border);
+      border-radius: 3px;
+      padding: 5px 12px;
+      pointer-events: none;
+      z-index: 7;
+    }
+    #hint {
+      position: absolute; bottom: 14px; right: 56px;
+      font-family: "JetBrains Mono", monospace;
+      font-size: 10px;
+      color: var(--hud-unit);
+      pointer-events: none;
+      z-index: 7;
+    }
+  </style>
+</head>
+<body>
+  <div id="stage"></div>
+  <canvas id="overlay"></canvas>
+  <div class="corner-tag" id="feed-tag"></div>
+  <div class="corner-tag" id="model-tag"></div>
+  <div id="note"></div>
+  <div id="hint"></div>
+
+  <script type="module">
+    import * as THREE from 'three';
+    import { createEnvironment } from '/src/kit/Environment.js';
+    import { createDrone }       from '/src/kit/Quadrotor.js';
+    import { createTrail }       from '/src/kit/Trajectory.js';
+    import { createPanel }       from '/src/kit/Hud.js';
+    import { labels }            from '/src/kit/labels.js';
+    import { theme, mountThemeToggle, hexToCss } from '/src/kit/theme.js';
+
+    const L = labels.ch08.pixels;
+    document.getElementById('feed-tag').textContent  = L.feedTag;
+    document.getElementById('model-tag').textContent = L.modelTag;
+    document.getElementById('note').textContent      = L.note;
+    document.getElementById('hint').textContent      = L.hint;
+
+    // ---- Layout ---------------------------------------------------------
+    // Top region: 3-D scene. Bottom region: schematic overlay. Both share
+    // one renderer; scissor limits 3-D rendering to the top region so the
+    // schematic owns the bottom unambiguously.
+    const TOP_FRAC = 0.58;
+
+    const stage = document.getElementById('stage');
+    let stageW = stage.clientWidth;
+    let stageH = stage.clientHeight;
+    const sceneRect = () => ({ x: 0, y: 0, w: stageW, h: Math.round(stageH * TOP_FRAC) });
+    const schemRect = () => {
+      const top = Math.round(stageH * TOP_FRAC);
+      return { x: 0, y: top, w: stageW, h: stageH - top };
+    };
+
+    // ---- Renderer + theme -----------------------------------------------
+    const { scene, addLights, dispose: disposeEnv } = createEnvironment({
+      grid: true, fog: true, floor: true, sceneSize: 50, logoClouds: false,
+    });
+    addLights();
+    mountThemeToggle();
+
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+    renderer.setSize(stageW, stageH);
+    renderer.setClearColor(theme.colors.bg, 1);
+    renderer.autoClear = false;
+    renderer.setScissorTest(true);
+    stage.appendChild(renderer.domElement);
+
+    // ---- World ----------------------------------------------------------
+    // Small obstacle field. Cylinder pillars vary in height + radius so the
+    // onboard view has visible structure across the band the camera sees.
+    const obstacleMat = new THREE.MeshStandardMaterial({
+      color: theme.colors.obstacle, roughness: 0.9, metalness: 0.05,
+    });
+    const obstacleGeoms = [];
+    const OBSTACLES = [
+      { x: -3.5, z:  1.2, r: 0.55, h: 3.2 },
+      { x:  2.0, z: -1.5, r: 0.45, h: 2.6 },
+      { x:  3.8, z:  3.0, r: 0.65, h: 3.6 },
+      { x: -2.0, z: -3.2, r: 0.40, h: 2.4 },
+      { x:  0.5, z:  3.8, r: 0.50, h: 2.8 },
+      { x: -4.5, z: -1.0, r: 0.45, h: 3.0 },
+    ];
+    for (const o of OBSTACLES) {
+      const g = new THREE.CylinderGeometry(o.r, o.r * 0.92, o.h, 18);
+      obstacleGeoms.push(g);
+      const m = new THREE.Mesh(g, obstacleMat);
+      m.position.set(o.x, o.h / 2, o.z);
+      scene.add(m);
+    }
+
+    // Goal beacons cycle: a small ring of 4 positions around the field.
+    // Active goal is bright; the others are inactive markers.
+    const GOALS = [
+      new THREE.Vector3( 4.5, 1.5,  4.5),
+      new THREE.Vector3( 4.5, 1.5, -4.5),
+      new THREE.Vector3(-4.5, 1.5, -4.5),
+      new THREE.Vector3(-4.5, 1.5,  4.5),
+    ];
+    const goalMat = new THREE.MeshBasicMaterial({ color: theme.colors.planning });
+    const goalGeo = new THREE.SphereGeometry(0.18, 16, 12);
+    const haloGeo = new THREE.SphereGeometry(0.55, 16, 12);
+    // Per-goal halo material so opacity can be modulated per beacon
+    // (active = bright, inactive = dim) without all four moving together.
+    const goalMeshes = GOALS.map((p) => {
+      const grp = new THREE.Group();
+      const haloMat = new THREE.MeshBasicMaterial({
+        color: theme.colors.planning, transparent: true, opacity: 0.10,
+        blending: theme.mode === 'light' ? THREE.NormalBlending : THREE.AdditiveBlending,
+      });
+      const core = new THREE.Mesh(goalGeo, goalMat);
+      const halo = new THREE.Mesh(haloGeo, haloMat);
+      grp.add(core); grp.add(halo);
+      grp.position.copy(p);
+      grp.userData = { core, halo, haloMat };
+      scene.add(grp);
+      return grp;
+    });
+
+    // Drone + trail. Start at GOALS[0] facing GOALS[1] so the first leg is
+    // a clean perimeter run (x = 4.5) rather than a diagonal across the
+    // central obstacles — pure potential-field steering can stall on the
+    // diagonal even with the tangential bias below.
+    const drone = createDrone({ scale: 0.9, accentColor: theme.colors.executed });
+    drone.group.position.set(GOALS[0].x, 1.6, GOALS[0].z);
+    scene.add(drone.group);
+
+    const trail = createTrail({ maxPoints: 600, color: theme.colors.executed });
+    scene.add(trail.line);
+
+    // ---- Cameras --------------------------------------------------------
+    // External: orbits high to give a view of the whole course + drone
+    // pose. Onboard: child of drone, looks forward (drone +z is forward;
+    // a default camera looks down its own -z, so rotate by π around y).
+    const externalCam = new THREE.PerspectiveCamera(48, 1, 0.1, 200);
+    const onboardCam = new THREE.PerspectiveCamera(72, 32 / 24, 0.05, 60);
+    onboardCam.position.set(0, 0.10, 0.18);
+    onboardCam.rotation.y = Math.PI;
+    drone.group.add(onboardCam);
+
+    // ---- Onboard render target ------------------------------------------
+    // 32 × 24 colour target. Pixels are read back to a Uint8Array each
+    // inference tick and converted to luminance for the conv pipeline.
+    const PIX_W = 32, PIX_H = 24;
+    const onboardRT = new THREE.WebGLRenderTarget(PIX_W, PIX_H, {
+      minFilter: THREE.NearestFilter, magFilter: THREE.NearestFilter,
+      format: THREE.RGBAFormat, type: THREE.UnsignedByteType,
+    });
+    const pixelBuf = new Uint8Array(PIX_W * PIX_H * 4);
+    const luma = new Float32Array(PIX_W * PIX_H);
+
+    // ---- Pseudo-network state ------------------------------------------
+    // Conv1: 4 hand-coded 3×3 kernels — H-Sobel, V-Sobel, diag, Laplacian.
+    // Conv2: 8 channels, each a fixed random 3×3×4 kernel applied at
+    // stride 2. FC: fixed 1536→32 random projection. All ReLU + per-frame
+    // normalisation for display. This isn't a trained policy; it is a
+    // visually coherent activation pipeline driven by real onboard pixels.
+    const C1_W = PIX_W, C1_H = PIX_H, C1_C = 4;
+    const C2_W = PIX_W >> 1, C2_H = PIX_H >> 1, C2_C = 8; // 16×12, 8 channels
+    const FC_N = 32;
+    const conv1 = [
+      new Float32Array(C1_W * C1_H), new Float32Array(C1_W * C1_H),
+      new Float32Array(C1_W * C1_H), new Float32Array(C1_W * C1_H),
+    ];
+    const conv2 = Array.from({ length: C2_C }, () => new Float32Array(C2_W * C2_H));
+    const fc = new Float32Array(FC_N);
+
+    // 3×3 kernels for conv1, listed row-major top→bottom, left→right.
+    const KERNELS_C1 = [
+      // H-Sobel
+      [-1, 0, 1,  -2, 0, 2,  -1, 0, 1],
+      // V-Sobel
+      [-1,-2,-1,   0, 0, 0,   1, 2, 1],
+      // Diagonal /
+      [ 0,-1,-2,   1, 0,-1,   2, 1, 0],
+      // Laplacian (blob)
+      [ 0,-1, 0,  -1, 4,-1,   0,-1, 0],
+    ];
+
+    // Deterministic RNG so the random weights stay identical per page load.
+    function mulberry32(a) {
+      return function () {
+        a |= 0; a = (a + 0x6D2B79F5) | 0;
+        let t = a;
+        t = Math.imul(t ^ (t >>> 15), t | 1);
+        t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+        return (((t ^ (t >>> 14)) >>> 0) / 4294967296);
+      };
+    }
+    const rng = mulberry32(0x57A1E0);
+    const randSym = () => (rng() - 0.5) * 2; // [-1, 1]
+
+    // Conv2 weights: 8 output channels × 4 input channels × 9 spatial.
+    const KERNELS_C2 = Array.from({ length: C2_C }, () =>
+      Array.from({ length: C1_C }, () =>
+        Array.from({ length: 9 }, () => randSym() * 0.7)));
+
+    // FC weights: FC_N × (C2_W*C2_H*C2_C). Scaled by 1/sqrt(fan-in) so the
+    // raw activations sit in roughly the same range every frame.
+    const FC_FAN_IN = C2_W * C2_H * C2_C;
+    const FC_SCALE = 1 / Math.sqrt(FC_FAN_IN);
+    const fcWeights = new Float32Array(FC_N * FC_FAN_IN);
+    for (let i = 0; i < fcWeights.length; i++) fcWeights[i] = randSym() * FC_SCALE;
+
+    // ---- Scripted policy -------------------------------------------------
+    // Potential-field-style steering toward the active goal with repulsion
+    // from nearby obstacles. Output is a 4-D action interpreted as
+    // body-frame velocity command + yaw rate — the standard interface
+    // exposed by vision-based RL drone policies.
+    let goalIdx = 1; // first target after the start position at GOALS[0]
+    let yaw = Math.PI; // face -Z (toward GOALS[1] = (4.5, -4.5) from (4.5, 4.5))
+    const action = { vz: 0, vx: 0, vy: 0, w: 0 };
+    const action_smooth = { vz: 0, vx: 0, vy: 0, w: 0 };
+    const ATTR_R = 8;     // soft attraction radius (m)
+    const REP_R  = 2.0;   // repulsion start (m)
+    const SPEED  = 1.6;   // max forward speed
+    const W_MAX  = 1.4;   // max yaw rate (rad/s)
+
+    function computeAction() {
+      const p = drone.group.position;
+      const goal = GOALS[goalIdx];
+      // Attraction in world XZ.
+      const ax = goal.x - p.x, az = goal.z - p.z;
+      const dGoal = Math.hypot(ax, az);
+      const goalUx = ax / Math.max(0.001, dGoal);
+      const goalUz = az / Math.max(0.001, dGoal);
+      const attrScale = Math.min(1, dGoal / ATTR_R);
+      let wx = goalUx * attrScale;
+      let wz = goalUz * attrScale;
+      // Repulsion + tangential bias. Pure radial repulsion has local
+      // minima where two obstacles' pushback vectors cancel; rotating the
+      // radial 90° and picking the sign that points toward the goal side
+      // gives the drone a "go around" component that resolves the stall.
+      for (const o of OBSTACLES) {
+        const dx = p.x - o.x, dz = p.z - o.z;
+        const dist = Math.max(0.05, Math.hypot(dx, dz));
+        const d = dist - o.r;
+        if (d < REP_R) {
+          const k = Math.max(0, 1 - d / REP_R);
+          const nx = dx / dist, nz = dz / dist;
+          let tx = -nz, tz = nx;
+          if (tx * goalUx + tz * goalUz < 0) { tx = -tx; tz = -tz; }
+          wx += nx * k * 0.9 + tx * k * 0.8;
+          wz += nz * k * 0.9 + tz * k * 0.8;
+        }
+      }
+      // Body frame: forward = (sin yaw, 0, cos yaw); right = (cos yaw, 0, -sin yaw).
+      const fx = Math.sin(yaw), fz = Math.cos(yaw);
+      const rx = Math.cos(yaw), rz = -Math.sin(yaw);
+      const v_fwd = wx * fx + wz * fz;
+      const v_lat = wx * rx + wz * rz;
+      // Desired heading = direction of (wx, wz). Yaw error wrapped to (-π, π].
+      const desiredYaw = Math.atan2(wx, wz);
+      let yawErr = desiredYaw - yaw;
+      while (yawErr >  Math.PI) yawErr -= 2 * Math.PI;
+      while (yawErr < -Math.PI) yawErr += 2 * Math.PI;
+      // Map to action vector. Vertical channel is gentle (the drone hovers
+      // around y = 1.5 with a small bob to make v_z visibly nonzero).
+      action.vx = Math.max(-1, Math.min(1, v_fwd)) * SPEED;
+      action.vy = Math.max(-1, Math.min(1, v_lat)) * SPEED * 0.6;
+      action.w  = Math.max(-1, Math.min(1, yawErr * 1.6)) * W_MAX;
+      action.vz = (1.5 - p.y) * 0.6 + Math.sin(performance.now() * 0.001 * 0.6) * 0.18;
+    }
+
+    function applyKinematics(dt) {
+      // Low-pass smoothing makes the bars and the drone read as steady,
+      // not the noisy 60-Hz jitter the raw atan2 would produce.
+      const a = 1 - Math.exp(-dt / 0.18);
+      action_smooth.vx += (action.vx - action_smooth.vx) * a;
+      action_smooth.vy += (action.vy - action_smooth.vy) * a;
+      action_smooth.vz += (action.vz - action_smooth.vz) * a;
+      action_smooth.w  += (action.w  - action_smooth.w ) * a;
+      const fx = Math.sin(yaw), fz = Math.cos(yaw);
+      const rx = Math.cos(yaw), rz = -Math.sin(yaw);
+      drone.group.position.x += (fx * action_smooth.vx + rx * action_smooth.vy) * dt;
+      drone.group.position.z += (fz * action_smooth.vx + rz * action_smooth.vy) * dt;
+      drone.group.position.y += action_smooth.vz * dt;
+      yaw += action_smooth.w * dt;
+      drone.group.rotation.y = yaw;
+      // Goal arrival → cycle to next.
+      const g = GOALS[goalIdx];
+      const d = Math.hypot(g.x - drone.group.position.x, g.z - drone.group.position.z);
+      if (d < 0.7) goalIdx = (goalIdx + 1) % GOALS.length;
+    }
+
+    // ---- Activation pipeline (driven by real onboard pixels) -----------
+    function runConv1() {
+      // Read render target into pixelBuf, convert to luminance.
+      renderer.readRenderTargetPixels(onboardRT, 0, 0, PIX_W, PIX_H, pixelBuf);
+      for (let i = 0; i < PIX_W * PIX_H; i++) {
+        const r = pixelBuf[i*4], g = pixelBuf[i*4+1], b = pixelBuf[i*4+2];
+        // Render targets store y bottom-up; flip for the schematic's
+        // top-down display so the input grid reads the same way as the
+        // 3-D view above it.
+        const x = i % PIX_W;
+        const yPx = PIX_H - 1 - ((i / PIX_W) | 0);
+        luma[yPx * PIX_W + x] = (0.299 * r + 0.587 * g + 0.114 * b) / 255;
+      }
+      // Apply each kernel; activations stored as |response| (edge magnitude).
+      for (let c = 0; c < C1_C; c++) {
+        const K = KERNELS_C1[c];
+        const out = conv1[c];
+        for (let y = 1; y < C1_H - 1; y++) {
+          for (let x = 1; x < C1_W - 1; x++) {
+            let s = 0, k = 0;
+            for (let dy = -1; dy <= 1; dy++)
+              for (let dx = -1; dx <= 1; dx++)
+                s += luma[(y + dy) * C1_W + (x + dx)] * K[k++];
+            out[y * C1_W + x] = Math.abs(s);
+          }
+        }
+      }
+    }
+
+    function runConv2() {
+      for (let oc = 0; oc < C2_C; oc++) {
+        const K = KERNELS_C2[oc];
+        const out = conv2[oc];
+        for (let y = 0; y < C2_H; y++) {
+          for (let x = 0; x < C2_W; x++) {
+            let s = 0;
+            // Stride-2 over conv1 with a 3×3 kernel per input channel.
+            const sx = x * 2, sy = y * 2;
+            for (let ic = 0; ic < C1_C; ic++) {
+              const Kic = K[ic];
+              const inMap = conv1[ic];
+              let k = 0;
+              for (let dy = 0; dy < 3; dy++)
+                for (let dx = 0; dx < 3; dx++) {
+                  const xx = Math.min(C1_W - 1, sx + dx);
+                  const yy = Math.min(C1_H - 1, sy + dy);
+                  s += inMap[yy * C1_W + xx] * Kic[k++];
+                }
+            }
+            out[y * C2_W + x] = Math.max(0, s); // ReLU
+          }
+        }
+      }
+    }
+
+    function runFC() {
+      for (let i = 0; i < FC_N; i++) {
+        let s = 0;
+        const wOff = i * FC_FAN_IN;
+        let k = 0;
+        for (let oc = 0; oc < C2_C; oc++) {
+          const map = conv2[oc];
+          for (let j = 0; j < C2_W * C2_H; j++) {
+            s += map[j] * fcWeights[wOff + k++];
+          }
+        }
+        fc[i] = Math.max(0, s); // ReLU
+      }
+    }
+
+    // Per-frame normalisation cache: max value across each layer for display.
+    function maxOf(arr) { let m = 0; for (let i = 0; i < arr.length; i++) if (arr[i] > m) m = arr[i]; return m; }
+
+    // ---- HUD panels -----------------------------------------------------
+    const statsPanel = createPanel({
+      title: L.statsPanel, corner: 'tr', color: 'amber',
+      items: [
+        { key: 'rate',   label: L.inferRate,  value: '30', unit: 'Hz' },
+        { key: 'params', label: L.paramCount, value: '~0.05M' },
+      ],
+    });
+    statsPanel.el.style.top = '54px';
+    stage.appendChild(statsPanel.el);
+
+    const actionPanel = createPanel({
+      title: L.actionPanel, corner: 'tl', color: 'amber',
+      items: [
+        { key: 'vz', label: L.actVz, value: '0.00', unit: 'm/s' },
+        { key: 'vx', label: L.actVx, value: '0.00', unit: 'm/s' },
+        { key: 'vy', label: L.actVy, value: '0.00', unit: 'm/s' },
+        { key: 'w',  label: L.actYaw, value: '0.00', unit: 'rad/s' },
+      ],
+    });
+    actionPanel.el.style.top = '54px';
+    stage.appendChild(actionPanel.el);
+
+    // ---- Overlay setup --------------------------------------------------
+    const overlayEl = document.getElementById('overlay');
+    const ctx = overlayEl.getContext('2d');
+    const dpr = Math.min(window.devicePixelRatio || 1, 2);
+    function sizeOverlay() {
+      overlayEl.width  = Math.floor(stageW * dpr);
+      overlayEl.height = Math.floor(stageH * dpr);
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    }
+    sizeOverlay();
+
+    // Theme-resolved CSS strings used by the schematic painter.
+    const CSS = {
+      bg:        getComputedStyle(document.documentElement).getPropertyValue('--stage-bg').trim() || '#07090d',
+      hudBorder: getComputedStyle(document.documentElement).getPropertyValue('--hud-border').trim(),
+      label:     getComputedStyle(document.documentElement).getPropertyValue('--label-fg').trim(),
+      strong:    getComputedStyle(document.documentElement).getPropertyValue('--label-strong-fg').trim(),
+      perception: hexToCss(theme.colors.perception),
+      planning:   hexToCss(theme.colors.planning),
+      control:    hexToCss(theme.colors.control),
+      executed:   hexToCss(theme.colors.executed),
+      divider:    getComputedStyle(document.documentElement).getPropertyValue('--hud-divider').trim(),
+    };
+
+    // ---- Schematic layout helpers --------------------------------------
+    // All five blocks scale to the available bottom-region width. Each
+    // block carries its own draw call; one shared layout function lays
+    // them out left-to-right so the spacing stays uniform.
+    function layoutBlocks() {
+      const r = schemRect();
+      const padX = 36, padY = 14;
+      const innerW = r.w - padX * 2;
+      // Reserve 50 px at the bottom for the caption row + clearance above
+      // the centred bottom note element (which sits at bottom: 12 px and
+      // is ~26 px tall — captions need to clear that).
+      const innerH = r.h - padY * 2 - 50;
+
+      // Five columns: widths are fractions of innerW; the remaining
+      // (1 − Σfracs) of innerW is split evenly across the four gaps.
+      const fracs = [0.16, 0.18, 0.16, 0.10, 0.22];
+      const totalFrac = fracs.reduce((a, b) => a + b, 0);
+      const gap = (innerW * (1 - totalFrac)) / (fracs.length - 1);
+      let x = r.x + padX;
+      const cols = fracs.map((f) => {
+        const col = { x, w: innerW * f, y: r.y + padY, h: innerH };
+        x += col.w + gap;
+        return col;
+      });
+      return { rect: r, cols, padX, padY, captionY: r.y + r.h - 44 };
+    }
+
+    // Theme-aware display lift for the input grid: in dark mode the scene
+    // is mostly very dark and direct grayscale render disappears against
+    // the near-black panel bg. Map [0,1] luma to a contrasting middle band
+    // so cells are always visible. The conv pipeline still consumes the
+    // raw luma values — this is display-only.
+    const DISP_SCALE = theme.mode === 'light' ? 0.86 : 0.78;
+    const DISP_OFF   = theme.mode === 'light' ? 0.04 : 0.20;
+
+    function drawInputBlock(col) {
+      const cellW = col.w / PIX_W;
+      const cellH = (col.h - 8) / PIX_H;
+      const cell = Math.min(cellW, cellH);
+      const drawW = cell * PIX_W, drawH = cell * PIX_H;
+      const x0 = col.x + (col.w - drawW) / 2;
+      const y0 = col.y + (col.h - drawH) / 2;
+      // Background frame.
+      ctx.fillStyle = CSS.bg;
+      ctx.fillRect(x0 - 1, y0 - 1, drawW + 2, drawH + 2);
+      ctx.strokeStyle = CSS.hudBorder;
+      ctx.lineWidth = 0.5;
+      ctx.strokeRect(x0 - 1, y0 - 1, drawW + 2, drawH + 2);
+      // Cells.
+      for (let y = 0; y < PIX_H; y++) {
+        for (let x = 0; x < PIX_W; x++) {
+          const v = luma[y * PIX_W + x];
+          const disp = Math.max(0, Math.min(1, v * DISP_SCALE + DISP_OFF));
+          const g = Math.floor(disp * 255);
+          ctx.fillStyle = `rgb(${g},${g},${g})`;
+          ctx.fillRect(x0 + x * cell, y0 + y * cell, cell + 0.5, cell + 0.5);
+        }
+      }
+    }
+
+    // Conv1: 4 maps stacked vertically. One channel colour for all maps.
+    function drawConvBlock(col, maps, mapW, mapH, colorCss) {
+      const nMaps = maps.length;
+      const gap = 6;
+      const totalGap = gap * (nMaps - 1);
+      const cellByH = (col.h - totalGap) / (nMaps * mapH);
+      const cellByW = col.w / mapW;
+      const cell = Math.min(cellByH, cellByW);
+      const drawW = cell * mapW;
+      const drawH = cell * mapH;
+      const x0 = col.x + (col.w - drawW) / 2;
+      const totalH = drawH * nMaps + totalGap;
+      const y0 = col.y + (col.h - totalH) / 2;
+
+      const [cr, cg, cb] = parseCss(colorCss);
+      for (let mi = 0; mi < nMaps; mi++) {
+        const map = maps[mi];
+        const m = maxOf(map) || 1;
+        const top = y0 + mi * (drawH + gap);
+        // Frame.
+        ctx.fillStyle = CSS.bg;
+        ctx.fillRect(x0 - 1, top - 1, drawW + 2, drawH + 2);
+        ctx.strokeStyle = CSS.hudBorder;
+        ctx.lineWidth = 0.5;
+        ctx.strokeRect(x0 - 1, top - 1, drawW + 2, drawH + 2);
+        for (let y = 0; y < mapH; y++) {
+          for (let x = 0; x < mapW; x++) {
+            const v = map[y * mapW + x] / m;
+            const a = Math.min(1, v);
+            ctx.fillStyle = `rgba(${cr},${cg},${cb},${a.toFixed(3)})`;
+            ctx.fillRect(x0 + x * cell, top + y * cell, cell + 0.5, cell + 0.5);
+          }
+        }
+      }
+    }
+
+    // FC: 32 cells laid out as 4 cols × 8 rows (compact and reads as a
+    // dense feature vector rather than a flat strip).
+    function drawFcBlock(col) {
+      const FC_COLS = 4, FC_ROWS = 8;
+      const gap = 2;
+      const cellW = (col.w - gap * (FC_COLS - 1)) / FC_COLS;
+      const cellH = (col.h - gap * (FC_ROWS - 1)) / FC_ROWS;
+      const cell = Math.min(cellW, cellH, 18);
+      const blockW = cell * FC_COLS + gap * (FC_COLS - 1);
+      const blockH = cell * FC_ROWS + gap * (FC_ROWS - 1);
+      const x0 = col.x + (col.w - blockW) / 2;
+      const y0 = col.y + (col.h - blockH) / 2;
+      const m = maxOf(fc) || 1;
+      const [cr, cg, cb] = parseCss(CSS.planning);
+      for (let i = 0; i < FC_N; i++) {
+        const r = i % FC_ROWS, c = (i / FC_ROWS) | 0;
+        const v = fc[i] / m;
+        ctx.fillStyle = `rgba(${cr},${cg},${cb},${Math.min(1, v).toFixed(3)})`;
+        ctx.fillRect(x0 + c * (cell + gap), y0 + r * (cell + gap), cell, cell);
+        ctx.strokeStyle = CSS.hudBorder;
+        ctx.lineWidth = 0.5;
+        ctx.strokeRect(x0 + c * (cell + gap), y0 + r * (cell + gap), cell, cell);
+      }
+    }
+
+    // Action bars: 4 horizontal bars with labels + numerics. Bars are
+    // bipolar (left = negative, right = positive) since v_x / v_y / ω_ψ
+    // are signed.
+    function drawActionBlock(col) {
+      const labels4 = [
+        { key: 'vz', txt: L.actVz, max: 1.0  },
+        { key: 'vx', txt: L.actVx, max: SPEED * 1.05 },
+        { key: 'vy', txt: L.actVy, max: SPEED * 0.7 },
+        { key: 'w',  txt: L.actYaw, max: W_MAX * 1.05 },
+      ];
+      const N = labels4.length;
+      const padTop = 6;
+      const rowH = (col.h - padTop) / N;
+      const labelW = 88;
+      const valW = 56;
+      const trackX = col.x + labelW;
+      const trackW = col.w - labelW - valW - 6;
+      ctx.font = '500 11px "Noto Sans SC", sans-serif';
+      ctx.textBaseline = 'middle';
+      const colorCss = CSS.control;
+      const [cr, cg, cb] = parseCss(colorCss);
+      for (let i = 0; i < N; i++) {
+        const y = col.y + padTop + i * rowH + rowH / 2;
+        const v = action_smooth[labels4[i].key];
+        const max = labels4[i].max;
+        const ratio = Math.max(-1, Math.min(1, v / max));
+        // Label.
+        ctx.fillStyle = CSS.label;
+        ctx.textAlign = 'right';
+        ctx.fillText(labels4[i].txt, col.x + labelW - 8, y);
+        // Track.
+        const trackH = 6;
+        ctx.fillStyle = `rgba(${cr},${cg},${cb},0.10)`;
+        ctx.fillRect(trackX, y - trackH / 2, trackW, trackH);
+        // Centre tick.
+        const cx = trackX + trackW / 2;
+        ctx.strokeStyle = CSS.hudBorder;
+        ctx.lineWidth = 0.5;
+        ctx.beginPath();
+        ctx.moveTo(cx, y - 5); ctx.lineTo(cx, y + 5);
+        ctx.stroke();
+        // Fill from centre.
+        ctx.fillStyle = colorCss;
+        const half = trackW / 2;
+        if (ratio >= 0) ctx.fillRect(cx, y - trackH / 2, ratio * half, trackH);
+        else            ctx.fillRect(cx + ratio * half, y - trackH / 2, -ratio * half, trackH);
+        // Numeric.
+        ctx.fillStyle = CSS.strong;
+        ctx.textAlign = 'left';
+        ctx.font = '500 11px "JetBrains Mono", monospace';
+        ctx.fillText(v.toFixed(2), trackX + trackW + 6, y);
+        ctx.font = '500 11px "Noto Sans SC", sans-serif';
+      }
+    }
+
+    // Soft connector curves between adjacent layer columns: 5 lines per
+    // gap fanned vertically across the right edge of the source and left
+    // edge of the destination. Suggests "many connections" without
+    // committing to drawing every weight.
+    function drawConnectors(cols) {
+      ctx.strokeStyle = CSS.divider;
+      ctx.lineWidth = 1;
+      for (let i = 0; i < cols.length - 1; i++) {
+        const a = cols[i], b = cols[i + 1];
+        const ax = a.x + a.w + 2;
+        const bx = b.x - 2;
+        const N = 5;
+        for (let k = 0; k < N; k++) {
+          const u = (k + 0.5) / N;
+          const ay = a.y + a.h * (0.18 + u * 0.64);
+          const by = b.y + b.h * (0.18 + u * 0.64);
+          const cx1 = ax + (bx - ax) * 0.5;
+          ctx.beginPath();
+          ctx.moveTo(ax, ay);
+          ctx.bezierCurveTo(cx1, ay, cx1, by, bx, by);
+          ctx.stroke();
+        }
+      }
+    }
+
+    function drawCaptions(layout) {
+      const [cInput, cConv1, cConv2, cFc, cAct] = layout.cols;
+      const captions = [L.layerInput, L.layerConv1, L.layerConv2, L.layerFc, L.layerAction];
+      ctx.fillStyle = CSS.label;
+      ctx.font = '500 11px "JetBrains Mono", monospace';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'alphabetic';
+      const cols = [cInput, cConv1, cConv2, cFc, cAct];
+      for (let i = 0; i < cols.length; i++) {
+        ctx.fillText(captions[i], cols[i].x + cols[i].w / 2, layout.captionY);
+      }
+    }
+
+    function parseCss(css) {
+      // Accept #rrggbb only — what hexToCss returns.
+      const r = parseInt(css.slice(1, 3), 16);
+      const g = parseInt(css.slice(3, 5), 16);
+      const b = parseInt(css.slice(5, 7), 16);
+      return [r, g, b];
+    }
+
+    function drawSchematic() {
+      const r = schemRect();
+      // Solid background fill so the WebGL bottom area (left at clear
+      // colour) is fully owned by the schematic.
+      ctx.fillStyle = CSS.bg;
+      ctx.fillRect(r.x, r.y, r.w, r.h);
+      // Top divider.
+      ctx.fillStyle = CSS.divider;
+      ctx.fillRect(r.x, r.y, r.w, 1);
+
+      const layout = layoutBlocks();
+      const [cInput, cConv1, cConv2, cFc, cAct] = layout.cols;
+
+      drawInputBlock(cInput);
+      drawConvBlock(cConv1, conv1, C1_W, C1_H, CSS.perception);
+      drawConvBlock(cConv2, conv2, C2_W, C2_H, CSS.planning);
+      drawFcBlock(cFc);
+      drawActionBlock(cAct);
+      drawConnectors([cInput, cConv1, cConv2, cFc, cAct]);
+      drawCaptions(layout);
+    }
+
+    // ---- External camera path ------------------------------------------
+    // Slow, very gentle orbit. Loop is 36 s; the drone takes roughly the
+    // same time to visit all four goals so the camera stays loosely paced
+    // with the action.
+    function externalCameraAt(t) {
+      const u = (t / 36) * Math.PI * 2;
+      const r = 13.5;
+      const y = 8.0 + Math.sin(t * 0.18) * 0.4;
+      return new THREE.Vector3(Math.cos(u) * r, y, Math.sin(u) * r);
+    }
+
+    // ---- Loop -----------------------------------------------------------
+    const clock = new THREE.Clock();
+    let elapsed = 0;
+    let inferAccum = 0;
+    const INFER_DT = 1 / 30; // 30 Hz "inference"
+
+    (function tick() {
+      const dt = Math.min(0.05, clock.getDelta());
+      elapsed += dt;
+
+      // --- Sim + camera + 3D --------------------------------------------
+      computeAction();
+      applyKinematics(dt);
+      drone.update(dt);
+      // Trail.
+      trail.push(drone.group.position);
+      // Goal beacon pulse.
+      const pulse = 1 + Math.sin(elapsed * 4) * 0.18;
+      for (let i = 0; i < goalMeshes.length; i++) {
+        const m = goalMeshes[i];
+        const active = (i === goalIdx);
+        m.userData.core.scale.setScalar(active ? pulse : 0.55);
+        m.userData.halo.material.opacity = active ? 0.22 : 0.06;
+      }
+
+      // External camera.
+      const camPos = externalCameraAt(elapsed);
+      externalCam.position.copy(camPos);
+      externalCam.lookAt(0, 1.2, 0);
+      const sR = sceneRect();
+      externalCam.aspect = sR.w / sR.h;
+      externalCam.updateProjectionMatrix();
+
+      // --- Render order -------------------------------------------------
+      // Onboard view to RT first (its viewport is the RT's full extent),
+      // then top-region 3-D view to the screen, then schematic overlay.
+      const oldTarget = renderer.getRenderTarget();
+      renderer.setRenderTarget(onboardRT);
+      renderer.setScissorTest(false);
+      renderer.setViewport(0, 0, PIX_W, PIX_H);
+      renderer.clear(true, true, true);
+      // Hide the drone so its own body doesn't fill the onboard view from
+      // inside-out. Trail is fine to leave on (it sits behind the camera).
+      drone.group.visible = false;
+      renderer.render(scene, onboardCam);
+      drone.group.visible = true;
+      renderer.setRenderTarget(oldTarget);
+
+      // Full-canvas clear to bg, then scissored top-region render.
+      renderer.setScissorTest(false);
+      renderer.setViewport(0, 0, stageW, stageH);
+      renderer.setScissor(0, 0, stageW, stageH);
+      renderer.clear(true, true, true);
+
+      const topY_gl = stageH - sR.h; // gl y origin is bottom
+      renderer.setScissorTest(true);
+      renderer.setViewport(sR.x, topY_gl, sR.w, sR.h);
+      renderer.setScissor(sR.x, topY_gl, sR.w, sR.h);
+      renderer.render(scene, externalCam);
+
+      // --- Inference (activations + HUD readouts) ----------------------
+      inferAccum += dt;
+      if (inferAccum >= INFER_DT) {
+        inferAccum = 0;
+        runConv1();
+        runConv2();
+        runFC();
+        actionPanel.setValue('vz', action_smooth.vz.toFixed(2));
+        actionPanel.setValue('vx', action_smooth.vx.toFixed(2));
+        actionPanel.setValue('vy', action_smooth.vy.toFixed(2));
+        actionPanel.setValue('w',  action_smooth.w.toFixed(2));
+      }
+
+      // --- Overlay -----------------------------------------------------
+      ctx.clearRect(0, 0, stageW, stageH);
+      drawSchematic();
+
+      requestAnimationFrame(tick);
+    })();
+
+    // ---- Resize + dispose ----------------------------------------------
+    addEventListener('resize', () => {
+      stageW = stage.clientWidth;
+      stageH = stage.clientHeight;
+      renderer.setSize(stageW, stageH);
+      sizeOverlay();
+    });
+    addEventListener('beforeunload', () => {
+      for (const g of obstacleGeoms) g.dispose();
+      obstacleMat.dispose();
+      goalGeo.dispose(); haloGeo.dispose();
+      goalMat.dispose();
+      for (const g of goalMeshes) g.userData.haloMat.dispose();
+      onboardRT.dispose();
+      drone.dispose(); trail.dispose();
+      statsPanel.dispose(); actionPanel.dispose();
+      disposeEnv(); renderer.dispose();
+    });
+  </script>
+</body>
+</html>
