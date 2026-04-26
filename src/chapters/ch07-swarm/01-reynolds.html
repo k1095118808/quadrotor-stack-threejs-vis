@@ -1,0 +1,605 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Ch7 · Reynolds 集群</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+SC:wght@300;400;500;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/src/kit/hud.css">
+  <style>
+    /* Reynolds boids — N agents in a bounded volume implementing the classic
+     * three-rule flocking model:
+     *   separation  steer away from neighbors closer than SEPARATION_R
+     *   alignment   match average heading of neighbors within PERCEPTION_R
+     *   cohesion    steer toward neighborhood centroid (same radius)
+     * A slow Lissajous virtual goal keeps the flock from settling into a
+     * single static ball. The focus boid carries translucent perception +
+     * separation spheres so the audience can see what each rule consults.
+     * O(N²) pairwise — fine for N = 36, no spatial hash needed. */
+
+    html, body { margin: 0; background: var(--stage-bg); color: var(--label-strong-fg);
+                 font-family: "Noto Sans SC", sans-serif; overflow: hidden; }
+    #stage { position: relative; width: 100vw; height: 100vh; }
+
+    #note {
+      position: absolute; top: 20px; left: 50%; transform: translateX(-50%);
+      font-family: "JetBrains Mono", monospace;
+      font-size: 11px;
+      color: var(--label-fg);
+      background: var(--label-bg);
+      border: 0.5px solid var(--label-border);
+      border-radius: 3px;
+      padding: 5px 12px;
+      pointer-events: none;
+    }
+    #legend {
+      position: absolute; top: 16px; right: 16px;
+      font-family: "JetBrains Mono", monospace;
+      font-size: 11px;
+      color: var(--label-fg);
+      background: var(--label-bg);
+      border: 0.5px solid var(--label-border);
+      border-radius: 6px;
+      padding: 8px 12px;
+      pointer-events: none;
+      letter-spacing: 0.02em;
+      line-height: 1.7;
+    }
+    #legend .row { display: flex; align-items: center; gap: 8px; }
+    #legend .swatch {
+      display: inline-block; width: 14px; height: 10px; border-radius: 2px;
+      border: 0.5px solid var(--label-border);
+    }
+    #legend .body  { background: var(--c-planning); }
+    #legend .focus { background: var(--c-executed); }
+    #legend .perc  { background: color-mix(in srgb, var(--c-planning) 22%, transparent);
+                     border-color: color-mix(in srgb, var(--c-planning) 60%, transparent); }
+    #legend .sep   { background: color-mix(in srgb, var(--c-executed) 22%, transparent);
+                     border-color: color-mix(in srgb, var(--c-executed) 60%, transparent); }
+    #legend .goal  { background: var(--c-control); }
+
+    #controls {
+      position: absolute; left: 50%; bottom: 22px;
+      transform: translateX(-50%);
+      display: flex; flex-direction: column;
+      gap: 8px;
+      width: min(680px, 88vw);
+      padding: 12px 18px 14px;
+      background: var(--hud-bg);
+      border: 0.5px solid var(--hud-border);
+      border-radius: 8px;
+      backdrop-filter: blur(2px);
+      -webkit-backdrop-filter: blur(2px);
+      pointer-events: auto;
+    }
+    .slider-row { display: grid; grid-template-columns: 70px 1fr 60px; gap: 12px; align-items: center; }
+    .slider-row .lab {
+      font-size: 11px; color: var(--hud-label);
+      font-family: "Noto Sans SC", sans-serif;
+    }
+    .slider-row .val {
+      font-family: "JetBrains Mono", monospace; font-size: 11px;
+      color: var(--label-strong-fg); font-variant-numeric: tabular-nums;
+      text-align: right;
+    }
+    input[type=range] {
+      -webkit-appearance: none; appearance: none;
+      width: 100%; height: 3px;
+      background: var(--hud-divider); border-radius: 2px; outline: none; cursor: pointer;
+    }
+    input[type=range]::-webkit-slider-thumb,
+    input[type=range]::-moz-range-thumb {
+      -webkit-appearance: none; appearance: none;
+      width: 14px; height: 14px; border-radius: 50%;
+      background: var(--c-planning); border: 0.5px solid var(--hud-border);
+    }
+    /* Slider thumb colors map to the legend semantics: separation = magenta
+     * (the "danger" rule that pushes apart), alignment = amber (steers
+     * heading), cohesion = green (pulls together). */
+    #sepRow input[type=range]::-webkit-slider-thumb,
+    #sepRow input[type=range]::-moz-range-thumb { background: var(--c-executed); }
+    #aliRow input[type=range]::-webkit-slider-thumb,
+    #aliRow input[type=range]::-moz-range-thumb { background: var(--c-control); }
+    #cohRow input[type=range]::-webkit-slider-thumb,
+    #cohRow input[type=range]::-moz-range-thumb { background: var(--c-perception); }
+
+    .presets { display: flex; gap: 6px; padding-top: 4px; }
+    .presets button {
+      flex: 1;
+      font-family: "Noto Sans SC", sans-serif;
+      font-size: 11px;
+      color: var(--label-fg);
+      background: transparent;
+      border: 0.5px solid var(--hud-border);
+      border-radius: 3px;
+      padding: 5px 0;
+      cursor: pointer;
+      transition: border-color 120ms, color 120ms;
+    }
+    .presets button:hover { border-color: var(--c-planning); color: var(--label-strong-fg); }
+    .presets button.active { border-color: var(--c-planning); color: var(--c-planning); }
+  </style>
+</head>
+<body>
+  <div id="stage"></div>
+  <div id="note"></div>
+  <div id="legend"></div>
+  <div id="controls">
+    <div class="slider-row" id="sepRow">
+      <span class="lab" id="sepLab">分离</span>
+      <input id="sepSlider" type="range" min="0" max="2.5" step="0.01" value="1.5">
+      <span class="val" id="sepVal">1.50</span>
+    </div>
+    <div class="slider-row" id="aliRow">
+      <span class="lab" id="aliLab">对齐</span>
+      <input id="aliSlider" type="range" min="0" max="2.5" step="0.01" value="1.0">
+      <span class="val" id="aliVal">1.00</span>
+    </div>
+    <div class="slider-row" id="cohRow">
+      <span class="lab" id="cohLab">聚合</span>
+      <input id="cohSlider" type="range" min="0" max="2.5" step="0.01" value="1.0">
+      <span class="val" id="cohVal">1.00</span>
+    </div>
+    <div class="presets">
+      <button data-preset="balanced" class="active">均衡</button>
+      <button data-preset="sep">仅分离</button>
+      <button data-preset="ali">仅对齐</button>
+      <button data-preset="coh">仅聚合</button>
+    </div>
+  </div>
+
+  <script type="module">
+    import * as THREE from 'three';
+    import { createEnvironment } from '/src/kit/Environment.js';
+    import { createPanel }       from '/src/kit/Hud.js';
+    import { labels }            from '/src/kit/labels.js';
+    import { theme, mountThemeToggle } from '/src/kit/theme.js';
+
+    const L = labels.ch07.reynolds;
+    document.getElementById('note').textContent = L.note;
+    document.getElementById('sepLab').textContent = L.ruleSep;
+    document.getElementById('aliLab').textContent = L.ruleAli;
+    document.getElementById('cohLab').textContent = L.ruleCoh;
+    {
+      const btns = document.querySelectorAll('.presets button');
+      btns[0].textContent = L.presetBalanced;
+      btns[1].textContent = L.presetSep;
+      btns[2].textContent = L.presetAli;
+      btns[3].textContent = L.presetCoh;
+    }
+    {
+      // Build the swatch legend from labels so it tracks the language policy.
+      const legend = document.getElementById('legend');
+      legend.innerHTML = `
+        <div class="row"><span class="swatch body"></span>  <span>${L.legendBody}</span></div>
+        <div class="row"><span class="swatch focus"></span> <span>${L.legendFocus}</span></div>
+        <div class="row"><span class="swatch perc"></span>  <span>${L.legendPerc}</span></div>
+        <div class="row"><span class="swatch sep"></span>   <span>${L.legendSep}</span></div>
+        <div class="row"><span class="swatch goal"></span>  <span>${L.legendGoal}</span></div>
+      `;
+    }
+
+    // --- Scene -------------------------------------------------------------
+    const stage = document.getElementById('stage');
+    const { scene, addLights } = createEnvironment({
+      grid: true, fog: true, floor: true, sceneSize: 50, logoClouds: false,
+    });
+    addLights();
+    mountThemeToggle();
+
+    const camera = new THREE.PerspectiveCamera(50, stage.clientWidth / stage.clientHeight, 0.1, 120);
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+    renderer.setSize(stage.clientWidth, stage.clientHeight);
+    stage.appendChild(renderer.domElement);
+
+    // --- Bounded volume ----------------------------------------------------
+    // Half-extents of the box the swarm lives in. Soft walls push back when
+    // boids leave; a wireframe outline tells viewers "this is the workspace".
+    const BOX = { x: 12, y: 4.5, z: 12 };
+    const BOX_CY = 4.5;
+
+    {
+      const boxGeo = new THREE.BoxGeometry(BOX.x*2, BOX.y*2, BOX.z*2);
+      const edges = new THREE.EdgesGeometry(boxGeo);
+      const mat = new THREE.LineBasicMaterial({
+        color: theme.colors.grid, transparent: true,
+        opacity: theme.mode === 'light' ? 0.45 : 0.32,
+      });
+      const lines = new THREE.LineSegments(edges, mat);
+      lines.position.y = BOX_CY;
+      scene.add(lines);
+    }
+
+    // --- Boid state --------------------------------------------------------
+    const N = 36;
+    const pos = new Float32Array(N * 3);
+    const vel = new Float32Array(N * 3);
+    const acc = new Float32Array(N * 3);
+
+    // Init: random start scattered across the volume, modest random heading.
+    // Spread vertically too so the audience reads this as 3-D from frame 1.
+    for (let i = 0; i < N; i++) {
+      pos[i*3+0] = (Math.random() - 0.5) * BOX.x * 1.2;
+      pos[i*3+1] = BOX_CY + (Math.random() - 0.5) * BOX.y * 1.2;
+      pos[i*3+2] = (Math.random() - 0.5) * BOX.z * 1.2;
+      const a = Math.random() * Math.PI * 2;
+      vel[i*3+0] = Math.cos(a) * 1.5;
+      vel[i*3+1] = (Math.random() - 0.5) * 0.5;
+      vel[i*3+2] = Math.sin(a) * 1.5;
+    }
+
+    const FOCUS = 0;                 // index of the highlighted boid
+    const PERCEPTION_R = 3.2;        // alignment + cohesion neighborhood
+    const SEPARATION_R = 1.5;        // separation operates closer than this
+    const MAX_SPEED    = 4.5;        // m/s
+    const MAX_FORCE    = 7.5;        // m/s² — cap per-rule steering
+    const GOAL_W       = 0.45;       // weight of pull toward the moving goal
+    const WALL_K       = 6.0;        // soft-wall pushback gain
+
+    // Slider-controlled rule weights. Defaults match the "balanced" preset.
+    const W = { sep: 1.5, ali: 1.0, coh: 1.0 };
+
+    // --- Boid mesh ---------------------------------------------------------
+    // A small dart: cone with apex pointing along +z. setFromUnitVectors then
+    // aligns +z to the boid's velocity each frame. 6 sides keeps the silhouette
+    // crisp without paying for unnecessary geometry at N = 36.
+    const dartGeo = new THREE.ConeGeometry(0.16, 0.55, 6);
+    dartGeo.rotateX(Math.PI / 2);
+
+    const dartMat = new THREE.MeshStandardMaterial({
+      color: 0xffffff, metalness: 0.10, roughness: 0.55,
+    });
+    const boidMesh = new THREE.InstancedMesh(dartGeo, dartMat, N);
+    boidMesh.instanceColor = new THREE.InstancedBufferAttribute(new Float32Array(N * 3), 3);
+    scene.add(boidMesh);
+
+    // Per-instance color: focus boid magenta; everyone else cyan with mild
+    // luminance jitter so the swarm has internal texture.
+    {
+      const cFocus = new THREE.Color(theme.colors.executed);
+      const cBody  = new THREE.Color(theme.colors.planning);
+      const tmp = new THREE.Color();
+      const hsl = {};
+      for (let i = 0; i < N; i++) {
+        if (i === FOCUS) {
+          boidMesh.setColorAt(i, cFocus);
+        } else {
+          tmp.copy(cBody);
+          tmp.getHSL(hsl);
+          hsl.l = clamp(hsl.l + (Math.random() - 0.5) * 0.20, 0.32, 0.82);
+          tmp.setHSL(hsl.h, hsl.s, hsl.l);
+          boidMesh.setColorAt(i, tmp);
+        }
+      }
+      boidMesh.instanceColor.needsUpdate = true;
+    }
+
+    // --- Focus-boid neighborhood spheres ------------------------------------
+    // Two nested translucent spheres centered on the focus boid. Audience sees
+    // exactly what alignment+cohesion (outer cyan) and separation (inner
+    // magenta) consult on every step. NormalBlending across both modes — light
+    // mode would lose AdditiveBlending against the white bg.
+    const sphereGeo = new THREE.SphereGeometry(1, 22, 14);
+    const percMat = new THREE.MeshBasicMaterial({
+      color: theme.colors.planning, transparent: true,
+      opacity: theme.mode === 'light' ? 0.10 : 0.06,
+      depthWrite: false, blending: THREE.NormalBlending,
+    });
+    const sepMat = new THREE.MeshBasicMaterial({
+      color: theme.colors.executed, transparent: true,
+      opacity: theme.mode === 'light' ? 0.16 : 0.11,
+      depthWrite: false, blending: THREE.NormalBlending,
+    });
+    const percSphere = new THREE.Mesh(sphereGeo, percMat);
+    percSphere.scale.setScalar(PERCEPTION_R);
+    scene.add(percSphere);
+    const sepSphere = new THREE.Mesh(sphereGeo, sepMat);
+    sepSphere.scale.setScalar(SEPARATION_R);
+    scene.add(sepSphere);
+
+    // --- Virtual goal ------------------------------------------------------
+    // Wandering target the flock follows. Without it, "ali only" preset would
+    // converge to a single drifting line and "coh only" to a static cluster —
+    // the audience needs to see the rules acting against motion to read them.
+    const goal = new THREE.Vector3(0, BOX_CY, 0);
+    const goalMat = new THREE.MeshBasicMaterial({
+      color: theme.colors.control, transparent: true, opacity: 0.85,
+    });
+    const goalMarker = new THREE.Mesh(
+      new THREE.SphereGeometry(0.22, 16, 10), goalMat,
+    );
+    scene.add(goalMarker);
+    // Soft halo so the marker reads against the floor grid.
+    const goalHalo = new THREE.Mesh(
+      new THREE.SphereGeometry(0.55, 16, 10),
+      new THREE.MeshBasicMaterial({
+        color: theme.colors.control, transparent: true,
+        opacity: theme.mode === 'light' ? 0.22 : 0.14,
+        depthWrite: false, blending: THREE.NormalBlending,
+      }),
+    );
+    scene.add(goalHalo);
+
+    // --- HUD ---------------------------------------------------------------
+    const statsPanel = createPanel({
+      title: L.statsPanel,
+      corner: 'tl', color: 'cyan',
+      items: [
+        { label: L.boidCount,  value: String(N),  key: 'count' },
+        { label: L.meanSpeed,  value: '0.00', unit: 'm·s⁻¹', key: 'speed' },
+        { label: L.focusNeigh, value: '0', key: 'neigh' },
+        { label: L.percRadius, value: PERCEPTION_R.toFixed(1), unit: 'm', key: 'percR' },
+        { label: L.sepRadius,  value: SEPARATION_R.toFixed(1), unit: 'm', key: 'sepR' },
+      ],
+    });
+    stage.appendChild(statsPanel.el);
+
+    const hintPanel = createPanel({
+      title: L.paramPanel,
+      corner: 'bl', color: 'white',
+      items: [
+        { label: L.ruleSep, value: W.sep.toFixed(2), key: 'sepW' },
+        { label: L.ruleAli, value: W.ali.toFixed(2), key: 'aliW' },
+        { label: L.ruleCoh, value: W.coh.toFixed(2), key: 'cohW' },
+      ],
+    });
+    stage.appendChild(hintPanel.el);
+
+    // --- Controls ----------------------------------------------------------
+    function bindSlider(key) {
+      const slider = document.getElementById(key + 'Slider');
+      const valEl  = document.getElementById(key + 'Val');
+      slider.value = W[key];
+      valEl.textContent = W[key].toFixed(2);
+      slider.addEventListener('input', () => {
+        W[key] = parseFloat(slider.value);
+        valEl.textContent = W[key].toFixed(2);
+        hintPanel.setValue(key + 'W', W[key].toFixed(2));
+        deactivatePresets();
+      });
+    }
+    bindSlider('sep');
+    bindSlider('ali');
+    bindSlider('coh');
+
+    // Presets push the sliders + W in lockstep. "Only X" presets keep a tiny
+    // residual separation so boids don't vanish into a single point — the
+    // teaching point is the rule's contribution, not a degenerate edge case.
+    const PRESETS = {
+      balanced: { sep: 1.5, ali: 1.0, coh: 1.0 },
+      sep:      { sep: 2.0, ali: 0.0, coh: 0.0 },
+      ali:      { sep: 0.3, ali: 2.0, coh: 0.0 },
+      coh:      { sep: 0.3, ali: 0.0, coh: 2.0 },
+    };
+    function applyPreset(p) {
+      W.sep = p.sep; W.ali = p.ali; W.coh = p.coh;
+      for (const k of ['sep', 'ali', 'coh']) {
+        document.getElementById(k + 'Slider').value = W[k];
+        document.getElementById(k + 'Val').textContent = W[k].toFixed(2);
+        hintPanel.setValue(k + 'W', W[k].toFixed(2));
+      }
+    }
+    function deactivatePresets() {
+      document.querySelectorAll('.presets button').forEach(b => b.classList.remove('active'));
+    }
+    document.querySelectorAll('.presets button').forEach(btn => {
+      btn.addEventListener('click', () => {
+        applyPreset(PRESETS[btn.dataset.preset]);
+        deactivatePresets();
+        btn.classList.add('active');
+      });
+    });
+
+    // --- Physics step ------------------------------------------------------
+    // Each frame: zero accel, accumulate per-rule steering forces, soft-wall
+    // pushback, integrate vel and pos. Forces are computed in m/s² and
+    // multiplied by the live W.{sep,ali,coh} weights.
+    function step(dt, t) {
+      // Goal wanders on a slow Lissajous that stays well inside the box.
+      goal.set(
+        Math.cos(t * 0.18) * BOX.x * 0.55,
+        BOX_CY + Math.sin(t * 0.13) * BOX.y * 0.45,
+        Math.sin(t * 0.22) * BOX.z * 0.55,
+      );
+
+      const sepR2  = SEPARATION_R * SEPARATION_R;
+      const percR2 = PERCEPTION_R * PERCEPTION_R;
+
+      for (let i = 0; i < N; i++) {
+        const pix = pos[i*3], piy = pos[i*3+1], piz = pos[i*3+2];
+        const vix = vel[i*3], viy = vel[i*3+1], viz = vel[i*3+2];
+
+        let sepX = 0, sepY = 0, sepZ = 0;
+        let aliX = 0, aliY = 0, aliZ = 0;
+        let cohX = 0, cohY = 0, cohZ = 0;
+        let nNeigh = 0, nSep = 0;
+
+        for (let j = 0; j < N; j++) {
+          if (j === i) continue;
+          const dx = pix - pos[j*3];
+          const dy = piy - pos[j*3+1];
+          const dz = piz - pos[j*3+2];
+          const d2 = dx*dx + dy*dy + dz*dz;
+          if (d2 >= percR2) continue;
+          aliX += vel[j*3];   aliY += vel[j*3+1];   aliZ += vel[j*3+2];
+          cohX += pos[j*3];   cohY += pos[j*3+1];   cohZ += pos[j*3+2];
+          nNeigh++;
+          if (d2 < sepR2 && d2 > 1e-6) {
+            // Weight by 1/d so closer neighbors dominate the push.
+            const inv = 1 / Math.sqrt(d2);
+            sepX += dx * inv * inv;
+            sepY += dy * inv * inv;
+            sepZ += dz * inv * inv;
+            nSep++;
+          }
+        }
+
+        let ax = 0, ay = 0, az = 0;
+        if (nSep > 0) {
+          const s = addSteering(sepX, sepY, sepZ, vix, viy, viz, W.sep);
+          ax += s.x; ay += s.y; az += s.z;
+        }
+
+        if (nNeigh > 0) {
+          aliX /= nNeigh; aliY /= nNeigh; aliZ /= nNeigh;
+          const a = addSteering(aliX, aliY, aliZ, vix, viy, viz, W.ali);
+          ax += a.x; ay += a.y; az += a.z;
+
+          cohX = cohX / nNeigh - pix;
+          cohY = cohY / nNeigh - piy;
+          cohZ = cohZ / nNeigh - piz;
+          const c = addSteering(cohX, cohY, cohZ, vix, viy, viz, W.coh);
+          ax += c.x; ay += c.y; az += c.z;
+        }
+
+        // Goal pull — independent of neighborhood, always on at low weight.
+        {
+          const dGx = goal.x - pix, dGy = goal.y - piy, dGz = goal.z - piz;
+          const g = addSteering(dGx, dGy, dGz, vix, viy, viz, GOAL_W);
+          ax += g.x; ay += g.y; az += g.z;
+        }
+
+        // Soft container — quadratic pushback when outside the half-extents.
+        const ox = pix - clamp(pix, -BOX.x, BOX.x);
+        const oy = (piy - BOX_CY) - clamp(piy - BOX_CY, -BOX.y, BOX.y);
+        const oz = piz - clamp(piz, -BOX.z, BOX.z);
+        ax -= WALL_K * ox * (1 + Math.abs(ox));
+        ay -= WALL_K * oy * (1 + Math.abs(oy));
+        az -= WALL_K * oz * (1 + Math.abs(oz));
+
+        acc[i*3]   = ax;
+        acc[i*3+1] = ay;
+        acc[i*3+2] = az;
+      }
+
+      // Integrate. Speed cap keeps the demo readable when weights are extreme.
+      for (let i = 0; i < N; i++) {
+        vel[i*3]   += acc[i*3]   * dt;
+        vel[i*3+1] += acc[i*3+1] * dt;
+        vel[i*3+2] += acc[i*3+2] * dt;
+        const sp = Math.hypot(vel[i*3], vel[i*3+1], vel[i*3+2]);
+        if (sp > MAX_SPEED) {
+          const k = MAX_SPEED / sp;
+          vel[i*3] *= k; vel[i*3+1] *= k; vel[i*3+2] *= k;
+        }
+        pos[i*3]   += vel[i*3]   * dt;
+        pos[i*3+1] += vel[i*3+1] * dt;
+        pos[i*3+2] += vel[i*3+2] * dt;
+      }
+    }
+
+    // Reusable steering helper. Given a desired-direction vector (dx,dy,dz),
+    // current velocity (vx,vy,vz), and weight w, returns the steering force
+    // = (desired_unit · MAX_SPEED − v) clipped to MAX_FORCE, scaled by w.
+    // Returns a shared { x, y, z } — read it before the next call.
+    const _steer = { x: 0, y: 0, z: 0 };
+    function addSteering(dx, dy, dz, vx, vy, vz, w) {
+      _steer.x = 0; _steer.y = 0; _steer.z = 0;
+      if (w === 0) return _steer;
+      const m = Math.hypot(dx, dy, dz);
+      if (m < 1e-8) return _steer;
+      const inv = MAX_SPEED / m;
+      let stx = dx * inv - vx;
+      let sty = dy * inv - vy;
+      let stz = dz * inv - vz;
+      const sm = Math.hypot(stx, sty, stz);
+      if (sm > MAX_FORCE) {
+        const k = MAX_FORCE / sm;
+        stx *= k; sty *= k; stz *= k;
+      }
+      _steer.x = stx * w;
+      _steer.y = sty * w;
+      _steer.z = stz * w;
+      return _steer;
+    }
+
+    // --- Mesh write-back ---------------------------------------------------
+    const dummyM = new THREE.Matrix4();
+    const dummyP = new THREE.Vector3();
+    const dummyQ = new THREE.Quaternion();
+    const dummyS = new THREE.Vector3(1, 1, 1);
+    const baseDir = new THREE.Vector3(0, 0, 1);
+    const tmpDir = new THREE.Vector3();
+
+    function updateMeshes() {
+      for (let i = 0; i < N; i++) {
+        dummyP.set(pos[i*3], pos[i*3+1], pos[i*3+2]);
+        tmpDir.set(vel[i*3], vel[i*3+1], vel[i*3+2]);
+        if (tmpDir.lengthSq() > 1e-8) {
+          tmpDir.normalize();
+          dummyQ.setFromUnitVectors(baseDir, tmpDir);
+        }
+        dummyM.compose(dummyP, dummyQ, dummyS);
+        boidMesh.setMatrixAt(i, dummyM);
+      }
+      boidMesh.instanceMatrix.needsUpdate = true;
+
+      // Focus neighborhood spheres + goal marker.
+      percSphere.position.set(pos[FOCUS*3], pos[FOCUS*3+1], pos[FOCUS*3+2]);
+      sepSphere.position.copy(percSphere.position);
+      goalMarker.position.copy(goal);
+      goalHalo.position.copy(goal);
+    }
+
+    function statsForFocus() {
+      const percR2 = PERCEPTION_R * PERCEPTION_R;
+      let nNeigh = 0;
+      let speedSum = 0;
+      const fx = pos[FOCUS*3], fy = pos[FOCUS*3+1], fz = pos[FOCUS*3+2];
+      for (let j = 0; j < N; j++) {
+        speedSum += Math.hypot(vel[j*3], vel[j*3+1], vel[j*3+2]);
+        if (j === FOCUS) continue;
+        const dx = pos[j*3]-fx, dy = pos[j*3+1]-fy, dz = pos[j*3+2]-fz;
+        if (dx*dx + dy*dy + dz*dz < percR2) nNeigh++;
+      }
+      return { nNeigh, meanSpeed: speedSum / N };
+    }
+
+    // --- Camera ------------------------------------------------------------
+    function updateCamera(t) {
+      const a = t * 0.10;
+      camera.position.set(
+        Math.cos(a) * 26,
+        12,
+        Math.sin(a) * 26,
+      );
+      camera.lookAt(0, BOX_CY, 0);
+    }
+
+    // --- Loop --------------------------------------------------------------
+    const clock = new THREE.Clock();
+    let elapsed = 0;
+    let hudTick = -1;
+    (function tick() {
+      let dt = clock.getDelta();
+      if (dt > 0.05) dt = 0.05; // tab-resume safety
+      elapsed += dt;
+      step(dt, elapsed);
+      updateMeshes();
+      updateCamera(elapsed);
+      // Throttle HUD updates so layout doesn't run every frame on slow text.
+      const t6 = Math.floor(elapsed * 6);
+      if (t6 !== hudTick) {
+        hudTick = t6;
+        const s = statsForFocus();
+        statsPanel.setValue('speed', s.meanSpeed.toFixed(2));
+        statsPanel.setValue('neigh', String(s.nNeigh));
+      }
+      renderer.render(scene, camera);
+      requestAnimationFrame(tick);
+    })();
+
+    // --- Resize ------------------------------------------------------------
+    addEventListener('resize', () => {
+      camera.aspect = stage.clientWidth / stage.clientHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(stage.clientWidth, stage.clientHeight);
+    });
+
+    function clamp(x, lo, hi) { return x < lo ? lo : x > hi ? hi : x; }
+  </script>
+</body>
+</html>

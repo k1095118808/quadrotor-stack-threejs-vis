@@ -390,6 +390,63 @@ export const labels = {
       hint:         '20 s 循环 · 置信度阈值 0.45',
     },
   },
+  ch07: {
+    reynoldsTitle: 'Reynolds 集群',
+    formationTitle: '编队飞行',
+    reynolds: {
+      // P1. ~36 boids in a bounded volume implementing classical separation /
+      // alignment / cohesion. A slowly moving virtual goal stops the flock
+      // from settling. The focus boid carries translucent perception +
+      // separation spheres so the audience can see what each rule consults.
+      paramPanel:    '集群参数',
+      statsPanel:    '统计',
+      legendPanel:   '图例',
+      boidCount:     '个体数',
+      meanSpeed:     '平均速度',
+      focusNeigh:    '焦点邻居',
+      percRadius:    '感知半径',
+      sepRadius:     '分离半径',
+      ruleSep:       '分离',
+      ruleAli:       '对齐',
+      ruleCoh:       '聚合',
+      goalLabel:     '虚拟目标',
+      presetBalanced:'均衡',
+      presetSep:     '仅分离',
+      presetAli:     '仅对齐',
+      presetCoh:     '仅聚合',
+      legendBody:    '普通个体',
+      legendFocus:   '焦点个体',
+      legendPerc:    '感知半径',
+      legendSep:     '分离半径',
+      legendGoal:    '虚拟目标',
+      note:          '三规则 · 分离 / 对齐 / 聚合 · 局部交互生成全局行为',
+      hint:          '36 个体 · 拖动滑条调节权重',
+    },
+    formation: {
+      // P1. 8 drones in a leader-follower formation. Leader flies a smooth
+      // closed loop; followers track commanded slots in the leader's body
+      // frame via a proportional + damping position controller. Three
+      // morph-able shapes: diamond, line, and 3×3 grid.
+      shapePanel:    '当前编队',
+      statsPanel:    '统计',
+      legendPanel:   '图例',
+      droneCount:    '个体数',
+      maxError:      '最大跟踪误差',
+      meanError:     '平均跟踪误差',
+      shapeDiamond:  '菱形',
+      shapeLine:     '一字',
+      shapeGrid:     '3×3 网格',
+      leaderTag:     '领飞',
+      followerTag:   '跟随',
+      ghostTag:      '指令位',
+      legendLeader:  '领飞机',
+      legendFollower:'跟随机',
+      legendGhost:   '指令位 · 鬼影',
+      legendPath:    '领飞航迹',
+      note:          '领-从结构 · 跟随机跟踪机体系内的指令位',
+      hint:          '8 机 · 点击切换编队形状',
+    },
+  },
   demo: {
     // Strings used only by src/kit-demo.html (Phase 0 acceptance test).
     title:     '工具包演示',
