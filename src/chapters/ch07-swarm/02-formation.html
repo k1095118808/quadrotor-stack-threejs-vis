@@ -1,0 +1,469 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Ch7 · 编队飞行</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+SC:wght@300;400;500;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/src/kit/hud.css">
+  <style>
+    /* Formation flight — leader-follower coordination. The leader (drone 0,
+     * amber accent) tracks an analytical 3-D Lissajous; its heading is the
+     * unit derivative of that path. Each of the 7 followers (cyan accent) has
+     * a slot offset in the leader's body frame; the commanded world position
+     * is rotated into world frame each step and the follower runs a P + D
+     * controller toward it. Three formation presets — diamond, line, 3-2-3
+     * grid — and a smooth 1.4 s slot lerp on morph so the audience sees the
+     * shape transition rather than a teleport. Ghost cones mark each
+     * follower's commanded slot so the gap between intent and tracking is
+     * visible. */
+
+    html, body { margin: 0; background: var(--stage-bg); color: var(--label-strong-fg);
+                 font-family: "Noto Sans SC", sans-serif; overflow: hidden; }
+    #stage { position: relative; width: 100vw; height: 100vh; }
+
+    #note {
+      position: absolute; top: 20px; left: 50%; transform: translateX(-50%);
+      font-family: "JetBrains Mono", monospace;
+      font-size: 11px;
+      color: var(--label-fg);
+      background: var(--label-bg);
+      border: 0.5px solid var(--label-border);
+      border-radius: 3px;
+      padding: 5px 12px;
+      pointer-events: none;
+    }
+    #legend {
+      position: absolute; top: 16px; right: 16px;
+      font-family: "JetBrains Mono", monospace;
+      font-size: 11px;
+      color: var(--label-fg);
+      background: var(--label-bg);
+      border: 0.5px solid var(--label-border);
+      border-radius: 6px;
+      padding: 8px 12px;
+      pointer-events: none;
+      letter-spacing: 0.02em;
+      line-height: 1.7;
+    }
+    #legend .row { display: flex; align-items: center; gap: 8px; }
+    #legend .swatch {
+      display: inline-block; width: 14px; height: 10px; border-radius: 2px;
+      border: 0.5px solid var(--label-border);
+    }
+    #legend .leader   { background: var(--c-control); }
+    #legend .follower { background: var(--c-planning); }
+    #legend .ghost    { background: color-mix(in srgb, var(--c-planning) 25%, transparent);
+                        border-color: color-mix(in srgb, var(--c-planning) 65%, transparent); }
+    #legend .path     { background: var(--c-executed); }
+
+    #shapes {
+      position: absolute; left: 50%; bottom: 22px;
+      transform: translateX(-50%);
+      display: flex; gap: 8px;
+      padding: 10px 14px;
+      background: var(--hud-bg);
+      border: 0.5px solid var(--hud-border);
+      border-radius: 8px;
+      backdrop-filter: blur(2px);
+      -webkit-backdrop-filter: blur(2px);
+      pointer-events: auto;
+    }
+    #shapes button {
+      font-family: "Noto Sans SC", sans-serif;
+      font-size: 12px;
+      color: var(--label-fg);
+      background: transparent;
+      border: 0.5px solid var(--hud-border);
+      border-radius: 4px;
+      padding: 7px 18px;
+      min-width: 96px;
+      cursor: pointer;
+      transition: border-color 120ms, color 120ms, background 120ms;
+    }
+    #shapes button:hover { border-color: var(--c-control); color: var(--label-strong-fg); }
+    #shapes button.active {
+      border-color: var(--c-control);
+      color: var(--c-control);
+      background: color-mix(in srgb, var(--c-control) 12%, transparent);
+    }
+  </style>
+</head>
+<body>
+  <div id="stage"></div>
+  <div id="note"></div>
+  <div id="legend"></div>
+  <div id="shapes">
+    <button data-shape="diamond" class="active">菱形</button>
+    <button data-shape="line">一字</button>
+    <button data-shape="grid">网格</button>
+  </div>
+
+  <script type="module">
+    import * as THREE from 'three';
+    import { createEnvironment } from '/src/kit/Environment.js';
+    import { createDrone }       from '/src/kit/Quadrotor.js';
+    import { createTrail }       from '/src/kit/Trajectory.js';
+    import { createPanel }       from '/src/kit/Hud.js';
+    import { labels }            from '/src/kit/labels.js';
+    import { theme, mountThemeToggle } from '/src/kit/theme.js';
+
+    const L = labels.ch07.formation;
+    document.getElementById('note').textContent = L.note;
+
+    // Wire shape buttons + legend to labels.
+    {
+      const btns = document.querySelectorAll('#shapes button');
+      btns[0].textContent = L.shapeDiamond;
+      btns[1].textContent = L.shapeLine;
+      btns[2].textContent = L.shapeGrid;
+    }
+    {
+      const legend = document.getElementById('legend');
+      legend.innerHTML = `
+        <div class="row"><span class="swatch leader"></span>   <span>${L.legendLeader}</span></div>
+        <div class="row"><span class="swatch follower"></span> <span>${L.legendFollower}</span></div>
+        <div class="row"><span class="swatch ghost"></span>    <span>${L.legendGhost}</span></div>
+        <div class="row"><span class="swatch path"></span>     <span>${L.legendPath}</span></div>
+      `;
+    }
+
+    // --- Scene -------------------------------------------------------------
+    const stage = document.getElementById('stage');
+    const { scene, addLights } = createEnvironment({
+      grid: true, fog: true, floor: true, sceneSize: 50,
+    });
+    addLights();
+    mountThemeToggle();
+
+    const camera = new THREE.PerspectiveCamera(50, stage.clientWidth / stage.clientHeight, 0.1, 120);
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+    renderer.setSize(stage.clientWidth, stage.clientHeight);
+    stage.appendChild(renderer.domElement);
+
+    // --- Formation slot tables ---------------------------------------------
+    // Each table has 7 entries — one per follower. Slots are in the leader's
+    // body frame: +x = right wing, +y = up, +z = forward (matches the leader
+    // dart's velocity direction). Followers sit BEHIND the leader (negative z).
+    // The "grid" preset is a 3-2-3 wedge, not literal 3×3 — 3×3 needs 9 slots
+    // for 8 drones (one would be empty), which reads as a missing-tooth gap.
+    const FORMATIONS = {
+      diamond: [
+        new THREE.Vector3( 1.9, 0.0, -1.6),
+        new THREE.Vector3(-1.9, 0.0, -1.6),
+        new THREE.Vector3( 0.0, 1.4, -1.6),
+        new THREE.Vector3( 0.0,-1.4, -1.6),
+        new THREE.Vector3( 1.4, 0.0, -3.4),
+        new THREE.Vector3(-1.4, 0.0, -3.4),
+        new THREE.Vector3( 0.0, 0.0, -4.6),
+      ],
+      line: [
+        new THREE.Vector3(0, 0, -1.8),
+        new THREE.Vector3(0, 0, -3.6),
+        new THREE.Vector3(0, 0, -5.4),
+        new THREE.Vector3(0, 0, -7.2),
+        new THREE.Vector3(0, 0, -9.0),
+        new THREE.Vector3(0, 0,-10.8),
+        new THREE.Vector3(0, 0,-12.6),
+      ],
+      grid: [
+        new THREE.Vector3(-2.0, 0.0,  0.0),  // wing-port,  same row as leader
+        new THREE.Vector3( 2.0, 0.0,  0.0),  // wing-stbd
+        new THREE.Vector3(-1.2, 0.0, -1.8),  // mid row, two slots
+        new THREE.Vector3( 1.2, 0.0, -1.8),
+        new THREE.Vector3(-2.2, 0.0, -3.6),  // back row, three slots
+        new THREE.Vector3( 0.0, 0.0, -3.6),
+        new THREE.Vector3( 2.2, 0.0, -3.6),
+      ],
+    };
+
+    const SHAPE_NAMES = {
+      diamond: L.shapeDiamond,
+      line:    L.shapeLine,
+      grid:    L.shapeGrid,
+    };
+
+    // Morph state: when the user clicks a shape, slotPrev becomes the active
+    // slot (interpolated from the previous lerp, so chained morphs feel
+    // continuous), slotNext is set to the new shape, and morphT ramps from 0
+    // → 1 over MORPH_DURATION. Active slot = lerp(slotPrev, slotNext, morphT).
+    const MORPH_DURATION = 1.4; // seconds — short enough to feel responsive
+    const slotPrev = Array.from({ length: 7 }, () => new THREE.Vector3());
+    const slotNext = Array.from({ length: 7 }, () => new THREE.Vector3());
+    const slotActive = Array.from({ length: 7 }, () => new THREE.Vector3());
+    let morphT = 1;
+    let currentShape = 'diamond';
+
+    function setFormation(name) {
+      // Snapshot the current active slot positions as the new "prev" so a
+      // mid-morph click doesn't snap.
+      for (let i = 0; i < 7; i++) slotPrev[i].copy(slotActive[i]);
+      const tgt = FORMATIONS[name];
+      for (let i = 0; i < 7; i++) slotNext[i].copy(tgt[i]);
+      morphT = 0;
+      currentShape = name;
+      document.querySelectorAll('#shapes button').forEach(b => {
+        b.classList.toggle('active', b.dataset.shape === name);
+      });
+    }
+
+    // Initial slot tables.
+    {
+      const init = FORMATIONS.diamond;
+      for (let i = 0; i < 7; i++) {
+        slotPrev[i].copy(init[i]);
+        slotNext[i].copy(init[i]);
+        slotActive[i].copy(init[i]);
+      }
+    }
+
+    document.querySelectorAll('#shapes button').forEach(btn => {
+      btn.addEventListener('click', () => setFormation(btn.dataset.shape));
+    });
+
+    // --- Drones ------------------------------------------------------------
+    // Leader: amber accent, slightly larger so it reads as the "principal" of
+    // the formation. Followers: cyan, smaller. All carry the kit's spinning
+    // rotors so the demo doesn't look like static cones.
+    const leader = createDrone({
+      scale: 1.0, accentColor: theme.colors.control,
+    });
+    scene.add(leader.group);
+
+    const NF = 7;
+    const followers = [];
+    for (let i = 0; i < NF; i++) {
+      const f = createDrone({
+        scale: 0.78, accentColor: theme.colors.planning,
+      });
+      scene.add(f.group);
+      followers.push({
+        kit: f,
+        pos: new THREE.Vector3(),
+        vel: new THREE.Vector3(),
+      });
+    }
+
+    // Ghost slot markers — small wireframe cones at the commanded slot.
+    // Wireframe reads as "intent / target", solid reads as "drone".
+    const ghostGeo = new THREE.ConeGeometry(0.18, 0.55, 6);
+    ghostGeo.rotateX(Math.PI / 2);
+    const ghostMat = new THREE.MeshBasicMaterial({
+      color: theme.colors.planning,
+      transparent: true,
+      opacity: theme.mode === 'light' ? 0.55 : 0.40,
+      wireframe: true,
+    });
+    const ghosts = [];
+    for (let i = 0; i < NF; i++) {
+      const m = new THREE.Mesh(ghostGeo, ghostMat);
+      scene.add(m);
+      ghosts.push(m);
+    }
+
+    // Leader trail — the magenta "executed" path the audience can read as
+    // the formation's overall trajectory.
+    const trail = createTrail({ maxPoints: 900, color: theme.colors.executed });
+    scene.add(trail.line);
+
+    // --- Leader path -------------------------------------------------------
+    // Analytical 3-D Lissajous. Computed in closed form so the leader's
+    // velocity (= path derivative) is exact — the followers' yaw frame and
+    // their velocity feedforward both depend on this being smooth.
+    const LEADER_R   = 8.5;
+    const LEADER_H   = 5.0;
+    const LEADER_AMP_Y = 1.2;
+    const W_X = 0.20;          // rad/s on cos for x
+    const W_Y = 0.32;          // rad/s on sin for y bob
+    const W_Z = 0.40;          // rad/s on sin for z (figure-8 in xz)
+    function leaderState(t, out) {
+      out.pos.set(
+        Math.cos(t * W_X) * LEADER_R,
+        LEADER_H + Math.sin(t * W_Y) * LEADER_AMP_Y,
+        Math.sin(t * W_Z) * LEADER_R * 0.55,
+      );
+      out.vel.set(
+        -Math.sin(t * W_X) * LEADER_R * W_X,
+        Math.cos(t * W_Y) * LEADER_AMP_Y * W_Y,
+        Math.cos(t * W_Z) * LEADER_R * 0.55 * W_Z,
+      );
+      return out;
+    }
+
+    // Follower controller gains. KP is a stiffness toward the commanded slot;
+    // KD damps approach to it. The KV term carries the leader's velocity as
+    // feedforward so steady-state lag at constant cruise is small. Tuned by
+    // eye for visible-but-bounded tracking error during morphs.
+    const KP = 6.0;
+    const KD = 4.5;
+    const KV_FF = 0.95;
+    const MAX_F_ACC = 14.0;   // accel cap so a big morph doesn't shoot drones
+
+    // Yaw quaternion that maps formation-frame (+z = forward) to world. We
+    // only rotate around y — rolls/pitches in formation slots would look
+    // weird since the kit drone has its own tiny body-axis convention.
+    const yawQ = new THREE.Quaternion();
+    const formFwd = new THREE.Vector3(0, 0, 1);
+    const headingForward = new THREE.Vector3(0, 0, 1);
+    const tmpForward = new THREE.Vector3();
+
+    // Init follower positions to their initial slots in world (around an
+    // assumed leader at LEADER_R, LEADER_H, 0). Avoids a 0.5 s "snap into
+    // place" at frame 1.
+    const leaderTmp = { pos: new THREE.Vector3(), vel: new THREE.Vector3() };
+    leaderState(0, leaderTmp);
+    {
+      tmpForward.copy(leaderTmp.vel);
+      tmpForward.y = 0;
+      if (tmpForward.lengthSq() > 1e-6) {
+        tmpForward.normalize();
+        headingForward.copy(tmpForward);
+      }
+      yawQ.setFromUnitVectors(formFwd, headingForward);
+      const slotW = new THREE.Vector3();
+      for (let i = 0; i < NF; i++) {
+        slotW.copy(slotActive[i]).applyQuaternion(yawQ).add(leaderTmp.pos);
+        followers[i].pos.copy(slotW);
+        followers[i].vel.copy(leaderTmp.vel);
+      }
+    }
+
+    // --- HUD ---------------------------------------------------------------
+    const statsPanel = createPanel({
+      title: L.statsPanel,
+      corner: 'tl', color: 'amber',
+      items: [
+        { label: L.shapePanel,  value: SHAPE_NAMES[currentShape], key: 'shape' },
+        { label: L.droneCount,  value: String(NF + 1), key: 'count' },
+        { label: L.maxError,    value: '0.00', unit: 'm', key: 'maxErr' },
+        { label: L.meanError,   value: '0.00', unit: 'm', key: 'meanErr' },
+      ],
+    });
+    stage.appendChild(statsPanel.el);
+
+    // --- Loop --------------------------------------------------------------
+    const clock = new THREE.Clock();
+    let elapsed = 0;
+    let hudTick = -1;
+    const slotW = new THREE.Vector3();
+    const errVec = new THREE.Vector3();
+
+    function step(dt, t) {
+      // 1. Leader.
+      leaderState(t, leaderTmp);
+      leader.group.position.copy(leaderTmp.pos);
+      // Yaw the leader so its dart-axis matches its velocity. The kit drone's
+      // local +x lies along its right arm; we want to face along velocity in
+      // the xz plane. Use atan2 on the world heading.
+      const ly = Math.atan2(leaderTmp.vel.x, leaderTmp.vel.z);
+      leader.group.rotation.y = ly;
+      // Tiny pitch from y velocity for visual interest.
+      leader.group.rotation.x = -leaderTmp.vel.y * 0.05;
+      leader.update(dt);
+      trail.push(leaderTmp.pos);
+
+      // 2. Slot interpolation.
+      morphT = Math.min(1, morphT + dt / MORPH_DURATION);
+      // smoothstep for a softer ease in/out of the morph.
+      const e = morphT * morphT * (3 - 2 * morphT);
+      for (let i = 0; i < 7; i++) {
+        slotActive[i].lerpVectors(slotPrev[i], slotNext[i], e);
+      }
+
+      // 3. Build leader yaw frame from xz heading (cached if vel is small).
+      tmpForward.set(leaderTmp.vel.x, 0, leaderTmp.vel.z);
+      if (tmpForward.lengthSq() > 1e-4) {
+        tmpForward.normalize();
+        headingForward.copy(tmpForward);
+      }
+      yawQ.setFromUnitVectors(formFwd, headingForward);
+
+      // 4. Followers.
+      for (let i = 0; i < NF; i++) {
+        const f = followers[i];
+        slotW.copy(slotActive[i]).applyQuaternion(yawQ).add(leaderTmp.pos);
+
+        // Ghost cone marks the commanded slot, oriented along leader heading.
+        ghosts[i].position.copy(slotW);
+        ghosts[i].quaternion.setFromUnitVectors(formFwd, headingForward);
+
+        // PD on position with leader-velocity feedforward.
+        errVec.copy(slotW).sub(f.pos);
+        const accX = KP * errVec.x + KV_FF * leaderTmp.vel.x - KD * f.vel.x;
+        const accY = KP * errVec.y + KV_FF * leaderTmp.vel.y - KD * f.vel.y;
+        const accZ = KP * errVec.z + KV_FF * leaderTmp.vel.z - KD * f.vel.z;
+        let aMag = Math.hypot(accX, accY, accZ);
+        const k = aMag > MAX_F_ACC ? MAX_F_ACC / aMag : 1;
+        f.vel.x += accX * k * dt;
+        f.vel.y += accY * k * dt;
+        f.vel.z += accZ * k * dt;
+        f.pos.x += f.vel.x * dt;
+        f.pos.y += f.vel.y * dt;
+        f.pos.z += f.vel.z * dt;
+
+        // Apply pose to the kit drone.
+        f.kit.group.position.copy(f.pos);
+        f.kit.group.rotation.y = ly;             // align follower yaw to leader
+        f.kit.group.rotation.x = -f.vel.y * 0.05;
+        f.kit.update(dt);
+      }
+    }
+
+    function tracking() {
+      let maxE = 0, sumE = 0;
+      const tmp = new THREE.Vector3();
+      for (let i = 0; i < NF; i++) {
+        tmp.copy(slotActive[i]).applyQuaternion(yawQ).add(leaderTmp.pos);
+        const d = tmp.distanceTo(followers[i].pos);
+        if (d > maxE) maxE = d;
+        sumE += d;
+      }
+      return { max: maxE, mean: sumE / NF };
+    }
+
+    function updateCamera(t) {
+      // Slow orbit around the leader; smoothed target so the leader bob
+      // doesn't transmit to the camera.
+      const a = t * 0.08;
+      const lookAt = leaderTmp.pos.clone();
+      const radius = 18;
+      const height = 9 + Math.sin(t * 0.05) * 1.0;
+      camera.position.set(
+        lookAt.x + Math.cos(a) * radius,
+        height,
+        lookAt.z + Math.sin(a) * radius,
+      );
+      camera.lookAt(lookAt);
+    }
+
+    (function tick() {
+      let dt = clock.getDelta();
+      if (dt > 0.05) dt = 0.05;
+      elapsed += dt;
+      step(dt, elapsed);
+      updateCamera(elapsed);
+
+      const t6 = Math.floor(elapsed * 6);
+      if (t6 !== hudTick) {
+        hudTick = t6;
+        const tr = tracking();
+        statsPanel.setValue('shape', SHAPE_NAMES[currentShape]);
+        statsPanel.setValue('maxErr',  tr.max.toFixed(2));
+        statsPanel.setValue('meanErr', tr.mean.toFixed(2));
+      }
+
+      renderer.render(scene, camera);
+      requestAnimationFrame(tick);
+    })();
+
+    addEventListener('resize', () => {
+      camera.aspect = stage.clientWidth / stage.clientHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(stage.clientWidth, stage.clientHeight);
+    });
+  </script>
+</body>
+</html>
