@@ -142,7 +142,7 @@ Two visual modes ship side by side:
 - **Dark** (default) — `#07090d` background, neon HUD, fog from 25 to 70.
 - **Light / paper** — true-white background with a deep purple/pink
   "NKU-ISAN-LAB" watermark baked into the floor and mirrored as an SVG
-  body-background tile. Seven `THREE.Sprite` copies of `src/assets/logo1.png`
+  body-background tile. Seven `THREE.Sprite` copies of `public/assets/logo1.png`
   drift overhead at y ≈ 6–12 in a slow circle. HUD panels flip to dark
   text on translucent white.
 
@@ -220,7 +220,7 @@ push reusable logic into the kit.
 
 - `src/kit/theme.js` — palette changes cascade to every animation.
 - `src/kit/labels.js` — Chinese copy reviewed together, not piecemeal.
-- `src/assets/logo1.png` — used by the light-theme logo clouds; the sprite
+- `public/assets/logo1.png` — used by the light-theme logo clouds; the sprite
   scaling auto-corrects from the decoded image, so a non-3:1 replacement
   changes the visible cloud footprint.
 

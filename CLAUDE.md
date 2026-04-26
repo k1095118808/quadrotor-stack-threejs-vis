@@ -102,7 +102,7 @@ In `'light'` mode the floor is painted with a baked `CanvasTexture` of
 repeating "NKU-ISAN-LAB" copies in a deep purple/pink, the fog far plane is
 pushed out, the lighting rig flattens (no colored rim), and a `Group` of 7
 logo-sprite "clouds" drifts in a slow circle overhead at y ≈ 6–12 (textured
-from `/src/assets/logo1.png`). All of this is handled inside
+from `/assets/logo1.png`). All of this is handled inside
 `createEnvironment` — chapters don't need to opt in. Dark mode is unchanged.
 Pass `logoClouds: false` when a chapter's visible Y range overlaps the
 6–12 m cloud band (orthographic altitude demos, any tight framing) so
@@ -273,7 +273,7 @@ every page mounts via `mountThemeToggle()`. Design notes:
 
 - **Floor** carries a deep purple/pink "NKU-ISAN-LAB" watermark baked as a
   `CanvasTexture`. `index.html` mirrors it as an inline-SVG body background.
-- **Logo clouds.** Seven `THREE.Sprite` copies of `/src/assets/logo1.png`
+- **Logo clouds.** Seven `THREE.Sprite` copies of `/assets/logo1.png`
   drift overhead at y ≈ 6–12 in a slow circle. Light-mode only.
 - **Palette** keeps all slot names but swaps in darker, more saturated RGB
   values — the dark neons wash out against white. HUD panel bg/border also
@@ -334,4 +334,4 @@ clock-shim architecture.
 
 - `src/kit/theme.js` — changing colors here cascades to every animation. Intentionally overhauled on 2026-04-24 to add the bright theme and mode-switching helpers; frozen again unless the user requests a further palette-level change.
 - `src/kit/labels.js` — same logic. Chinese copy should be reviewed together, not changed mid-stream.
-- `src/assets/logo1.png` — used by the bright theme's logo clouds. Replacing it is fine, but check the aspect ratio: `addLogoClouds()` auto-corrects sprite scale from the decoded image, so non-3:1 logos will change the visible cloud footprint.
+- `public/assets/logo1.png` — used by the bright theme's logo clouds. Replacing it is fine, but check the aspect ratio: `addLogoClouds()` auto-corrects sprite scale from the decoded image, so non-3:1 logos will change the visible cloud footprint.

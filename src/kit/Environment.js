@@ -127,7 +127,9 @@ export function createEnvironment({
 // through chapters, and no requestAnimationFrame loop owned by Environment.js.
 function addLogoClouds(scene, sceneSize) {
   const loader = new THREE.TextureLoader();
-  const tex = loader.load('/src/assets/logo1.png');
+  // BASE_URL respects vite's `base` config so the same path resolves
+  // whether the deck is served from '/' or a sub-path like '/repo-name/'.
+  const tex = loader.load(import.meta.env.BASE_URL + 'assets/logo1.png');
   tex.colorSpace = THREE.SRGBColorSpace;
   tex.anisotropy = 8;
 
